@@ -82,3 +82,63 @@ def test_environment_database_path(tmp_path, monkeypatch):
     with TestClient(create_app()) as client:
         assert database.is_file()
         assert client.get("/api/todos").json() == []
+
+
+def test_update_preserves_id_and_list_order(client):
+    items = [
+        client.post("/api/todos", json={"title": title}).json()
+        for title in ["First", "Second", "Third"]
+    ]
+    for index in [0, 1, 2, 0]:
+        response = client.patch(
+            f"/api/todos/{items[index]['id']}", json={"title": "  Edited ✓  "}
+        )
+        assert response.status_code == 200
+        items[index] = {"id": items[index]["id"], "title": "Edited ✓"}
+        assert response.json() == items[index]
+        assert client.get("/api/todos").json() == items
+    response = client.patch(
+        f"/api/todos/{items[1]['id']}", json={"title": "✓" * 500}
+    )
+    assert response.status_code == 200
+    items[1]["title"] = "✓" * 500
+    assert response.json() == items[1]
+    assert client.get("/api/todos").json() == items
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"title": ""}, {"title": " \t\n "}, {"title": "x" * 501},
+    {"title": None}, {"title": 123}, {"title": []},
+])
+def test_invalid_updates_are_rejected(client, payload):
+    item = client.post("/api/todos", json={"title": "Original"}).json()
+    response = client.patch(f"/api/todos/{item['id']}", json=payload)
+    assert response.status_code == 422
+    assert response.json()["detail"]
+    assert client.get("/api/todos").json() == [item]
+
+
+def test_update_unknown_or_removed_item(client):
+    item = client.post("/api/todos", json={"title": "Original"}).json()
+    response = client.patch("/api/todos/unknown", json={"title": "Edited"})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "To-do item not found"}
+    assert client.get("/api/todos").json() == [item]
+    assert client.delete(f"/api/todos/{item['id']}").status_code == 204
+    response = client.patch(f"/api/todos/{item['id']}", json={"title": "Edited"})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "To-do item not found"}
+    assert client.get("/api/todos").json() == []
+
+
+def test_edits_persist_after_restart(tmp_path):
+    database = tmp_path / "todos.duckdb"
+    with TestClient(create_app(database)) as client:
+        first = client.post("/api/todos", json={"title": "Original"}).json()
+        second = client.post("/api/todos", json={"title": "Unchanged"}).json()
+        edited = {"id": first["id"], "title": "Persisted edit"}
+        response = client.patch(f"/api/todos/{first['id']}", json={"title": edited["title"]})
+        assert response.status_code == 200
+        assert response.json() == edited
+    with TestClient(create_app(database)) as restarted:
+        assert restarted.get("/api/todos").json() == [edited, second]

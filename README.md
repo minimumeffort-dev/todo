@@ -1,7 +1,7 @@
 # Local To-do
 
 A local FastAPI app with DuckDB storage. Add tasks, view your list, and remove
-items when finished. Tasks remain available after reloading the page or restarting
+items when finished. Edit existing task titles inline. Tasks remain available after reloading the page or restarting
 the app.
 
 ## Install
@@ -25,7 +25,11 @@ use `.venv/bin/python -m pip install -e .` instead.
 
 Open <http://127.0.0.1:8000> in a browser with JavaScript enabled. Type a task
 and choose **Add task**, or press Enter. Choose **Remove** beside a task to
-delete it. **Refresh** reloads the list, including changes from other tabs.
+delete it. Choose **Edit** to change a title, then **Save** (or press Enter) to persist
+it. **Cancel** (or Escape) leaves the title unchanged. Failed saves preserve your
+draft and display an error; controls are disabled while a request is pending.
+**Refresh** reloads the list, including changes from other tabs, and is disabled
+while editing. Starting another edit discards the previous unsaved draft.
 Failed requests display an error and preserve your input or existing task.
 Stop the server with Ctrl+C.
 
@@ -48,14 +52,16 @@ TODO_DB_PATH=/absolute/path/to/todos.duckdb .venv/bin/python -m uvicorn app.main
 ```
 
 The API tests use temporary databases and cover adding, listing, deleting,
-invalid input, missing items, and persistence across application restarts.
+editing, invalid input, missing items, and persistence across application restarts.
 
 For a browser smoke check, start the app, add a uniquely named task, reload the
-page and confirm it remains, then remove it and reload again to confirm it is
-gone. An automated Chromium smoke check also verified this sequence in the
-Linux VM.
+page and confirm it remains. Edit it and cancel to confirm the title stays the
+same, then edit and save a new title and reload to confirm it persists. Finally,
+remove it and reload again to confirm it is gone. An automated Chromium smoke
+check also covers failed saves and disabled controls during pending saves.
 
 The API is available at `GET /api/todos`, `POST /api/todos` (JSON body
-`{"title": "Buy groceries"}`), and `DELETE /api/todos/{id}`. Titles are trimmed
+`{"title": "Buy groceries"}`), `PATCH /api/todos/{id}` (the same JSON body),
+and `DELETE /api/todos/{id}`. Titles are trimmed
 and must contain 1–500 characters. Interactive API documentation is at
 <http://127.0.0.1:8000/docs> while the app runs.

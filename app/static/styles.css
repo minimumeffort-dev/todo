@@ -23,6 +23,9 @@ h2 { font-size: 1rem; }
 #todo-list li { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px 0; border-top: 1px solid #edf0ea; }
 .task-title { overflow-wrap: anywhere; line-height: 1.5; }
 .remove { flex-shrink: 0; }
+.task-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.edit-form { display: flex; gap: 8px; width: 100%; flex-wrap: wrap; }
+.edit-form input { flex: 1 1 200px; }
 #status, footer { color: #65746b; font-size: .9rem; }
 #error { background: #fff0eb; color: #922f20; border-radius: 8px; padding: 12px; line-height: 1.5; }
 footer { text-align: center; margin-top: 24px; }

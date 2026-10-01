@@ -49,6 +49,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def add_todo(item: TodoInput):
         return store.add(item.title)
 
+    @application.patch("/api/todos/{item_id}", response_model=Todo)
+    def update_todo(item_id: str, item: TodoInput):
+        updated = store.update(item_id, item.title)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="To-do item not found")
+        return updated
+
     @application.delete("/api/todos/{item_id}", status_code=204)
     def delete_todo(item_id: str):
         if not store.delete(item_id):

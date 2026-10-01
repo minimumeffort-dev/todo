@@ -55,6 +55,14 @@ class TodoStore:
             )
         return item
 
+    def update(self, item_id: str, title: str) -> dict[str, str] | None:
+        with self._lock:
+            row = self._db().execute(
+                "UPDATE todos SET title = ? WHERE id = ? RETURNING id, title",
+                [title, item_id],
+            ).fetchone()
+        return {"id": row[0], "title": row[1]} if row is not None else None
+
     def delete(self, item_id: str) -> bool:
         with self._lock:
             row = self._db().execute(
