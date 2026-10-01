@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local To-do</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">ONE THING AT A TIME</p>
+      <h1>Your to-do list</h1>
+      <p>Make a little room for what matters. Add a task, then remove it when you're done.</p>
+    </header>
+    <section class="card" aria-label="To-do items">
+      <noscript><p>This page needs JavaScript to load, add, and remove your tasks. Enable JavaScript and reload the page.</p></noscript>
+      <form id="todo-form">
+        <label for="todo-title">What needs doing?</label>
+        <div class="input-row">
+          <input id="todo-title" name="title" placeholder="e.g. Pick up groceries" maxlength="500" required autocomplete="off" aria-describedby="error">
+          <button id="add-button" type="submit">Add task</button>
+        </div>
+      </form>
+      <p id="error" role="alert" hidden></p>
+      <div class="list-heading">
+        <h2>Tasks <span id="count">0</span></h2>
+        <button id="refresh-button" class="secondary" type="button">Refresh</button>
+      </div>
+      <p id="status" role="status">Loading your tasks…</p>
+      <ul id="todo-list" aria-label="Tasks"></ul>
+    </section>
+    <footer>Stored locally on this computer.</footer>
+  </main>
+</body>
+</html>

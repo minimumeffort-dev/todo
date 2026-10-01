@@ -1,0 +1,8 @@
+fastapi<1,>=0.115
+pydantic<3,>=2
+duckdb<2,>=1.1
+uvicorn<1,>=0.30
+
+[test]
+pytest<9,>=8
+httpx<1,>=0.27
