@@ -12,14 +12,18 @@
     <header>
       <p class="eyebrow">ONE THING AT A TIME</p>
       <h1>Your to-do list</h1>
-      <p>Make a little room for what matters. Add a task, then remove it when you're done.</p>
+      <p>Make a little room for what matters. Add a task, update it as plans change, then remove it when you're done.</p>
     </header>
     <section class="card" aria-label="To-do items">
-      <noscript><p>This page needs JavaScript to load, add, and remove your tasks. Enable JavaScript and reload the page.</p></noscript>
+      <noscript><p>This page needs JavaScript to load, add, edit, and remove your tasks. Enable JavaScript and reload the page.</p></noscript>
       <form id="todo-form">
         <label for="todo-title">What needs doing?</label>
         <div class="input-row">
           <input id="todo-title" name="title" placeholder="e.g. Pick up groceries" maxlength="500" required autocomplete="off" aria-describedby="error">
+          <div class="icon-field">
+            <label for="todo-icon">Icon</label>
+            <select id="todo-icon" name="icon"></select>
+          </div>
           <button id="add-button" type="submit">Add task</button>
         </div>
       </form>
