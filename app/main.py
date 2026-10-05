@@ -3,17 +3,21 @@
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from app.db import TodoStore
+from app.db import DEFAULT_ICON, TodoStore
+
+TodoIcon = Literal["task", "star", "home", "work", "shopping", "heart"]
 
 
 class TodoInput(BaseModel):
     title: str = Field(min_length=1, max_length=500)
+    icon: TodoIcon = DEFAULT_ICON
 
     @field_validator("title", mode="before")
     @classmethod
@@ -21,9 +25,14 @@ class TodoInput(BaseModel):
         return value.strip() if isinstance(value, str) else value
 
 
+class TodoUpdate(TodoInput):
+    icon: TodoIcon
+
+
 class Todo(BaseModel):
     id: str
     title: str
+    icon: TodoIcon
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
@@ -47,7 +56,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @application.post("/api/todos", response_model=Todo, status_code=201)
     def add_todo(item: TodoInput):
-        return store.add(item.title)
+        return store.add(item.title, item.icon)
+
+    @application.put("/api/todos/{item_id}", response_model=Todo)
+    def update_todo(item_id: str, item: TodoUpdate):
+        updated = store.update(item_id, item.title, item.icon)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="To-do item not found")
+        return updated
 
     @application.delete("/api/todos/{item_id}", status_code=204)
     def delete_todo(item_id: str):

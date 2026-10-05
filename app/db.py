@@ -6,6 +6,8 @@ from uuid import uuid4
 
 import duckdb
 
+DEFAULT_ICON = "task"
+
 
 class TodoStore:
     def __init__(self, path: str | Path):
@@ -22,6 +24,10 @@ class TodoStore:
                     "CREATE TABLE IF NOT EXISTS todos ("
                     "id VARCHAR PRIMARY KEY, title VARCHAR NOT NULL, "
                     "created_at TIMESTAMP NOT NULL DEFAULT current_timestamp)"
+                )
+                connection.execute(
+                    "ALTER TABLE todos ADD COLUMN IF NOT EXISTS icon "
+                    "VARCHAR DEFAULT 'task'"
                 )
             except Exception:
                 connection.close()
@@ -42,18 +48,26 @@ class TodoStore:
     def list(self) -> list[dict[str, str]]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT id, title FROM todos ORDER BY created_at, id"
+                "SELECT id, title, icon FROM todos ORDER BY created_at, id"
             ).fetchall()
-        return [{"id": row[0], "title": row[1]} for row in rows]
+        return [{"id": row[0], "title": row[1], "icon": row[2]} for row in rows]
 
-    def add(self, title: str) -> dict[str, str]:
-        item = {"id": str(uuid4()), "title": title}
+    def add(self, title: str, icon: str = DEFAULT_ICON) -> dict[str, str]:
+        item = {"id": str(uuid4()), "title": title, "icon": icon}
         with self._lock:
             self._db().execute(
-                "INSERT INTO todos (id, title) VALUES (?, ?)",
-                [item["id"], item["title"]],
+                "INSERT INTO todos (id, title, icon) VALUES (?, ?, ?)",
+                [item["id"], item["title"], item["icon"]],
             )
         return item
+
+    def update(self, item_id: str, title: str, icon: str) -> dict[str, str] | None:
+        with self._lock:
+            row = self._db().execute(
+                "UPDATE todos SET title = ?, icon = ? WHERE id = ? "
+                "RETURNING id, title, icon", [title, icon, item_id]
+            ).fetchone()
+        return {"id": row[0], "title": row[1], "icon": row[2]} if row else None
 
     def delete(self, item_id: str) -> bool:
         with self._lock:

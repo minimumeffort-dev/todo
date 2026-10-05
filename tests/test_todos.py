@@ -82,3 +82,75 @@ def test_environment_database_path(tmp_path, monkeypatch):
     with TestClient(create_app()) as client:
         assert database.is_file()
         assert client.get("/api/todos").json() == []
+
+
+def test_legacy_database_upgrade(tmp_path):
+    import duckdb
+
+    database = tmp_path / "legacy.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "CREATE TABLE todos (id VARCHAR PRIMARY KEY, title VARCHAR NOT NULL, "
+            "created_at TIMESTAMP NOT NULL DEFAULT current_timestamp)"
+        )
+        connection.execute("INSERT INTO todos (id, title) VALUES ('legacy', 'Old task')")
+    expected = {"id": "legacy", "title": "Old task", "icon": "task"}
+    for _ in range(2):
+        with TestClient(create_app(database)) as client:
+            assert client.get("/api/todos").json() == [expected]
+
+
+def test_edit_preserves_identity_order_and_persists(tmp_path):
+    database = tmp_path / "edit.duckdb"
+    with TestClient(create_app(database)) as client:
+        first = client.post("/api/todos", json={"title": "First", "icon": "star"}).json()
+        second = client.post("/api/todos", json={"title": "Second"}).json()
+        assert first["icon"] == "star"
+        assert second["icon"] == "task"
+        response = client.put(f"/api/todos/{first['id']}", json={"title": "  Edited  ", "icon": "home"})
+        assert response.status_code == 200
+        edited = {"id": first["id"], "title": "Edited", "icon": "home"}
+        assert response.json() == edited
+        assert client.get("/api/todos").json() == [edited, second]
+    with TestClient(create_app(database)) as restarted:
+        assert restarted.get("/api/todos").json() == [edited, second]
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"title": "Valid"}, {"title": "", "icon": "task"},
+    {"title": " \t\n", "icon": "task"}, {"title": "x" * 501, "icon": "task"},
+    {"title": None, "icon": "task"}, {"title": 123, "icon": "task"},
+    {"title": "Valid", "icon": "invalid"}, {"title": "Valid", "icon": None},
+    {"title": "Valid", "icon": 123}, {"title": "Valid", "icon": []},
+])
+def test_invalid_updates_leave_item_unchanged(client, payload):
+    original = client.post("/api/todos", json={"title": "Original", "icon": "heart"}).json()
+    response = client.put(f"/api/todos/{original['id']}", json=payload)
+    assert response.status_code == 422
+    assert response.json()["detail"]
+    assert client.get("/api/todos").json() == [original]
+
+
+@pytest.mark.parametrize("icon", ["invalid", "", None, 123, []])
+def test_invalid_create_icons(client, icon):
+    assert client.post("/api/todos", json={"title": "Task", "icon": icon}).status_code == 422
+    assert client.get("/api/todos").json() == []
+
+
+def test_update_missing_or_deleted_item(client):
+    payload = {"title": "Edited", "icon": "shopping"}
+    response = client.put("/api/todos/missing", json=payload)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "To-do item not found"}
+    original = client.post("/api/todos", json={"title": "Original"}).json()
+    assert client.delete(f"/api/todos/{original['id']}").status_code == 204
+    assert client.put(f"/api/todos/{original['id']}", json=payload).status_code == 404
+    assert client.get("/api/todos").json() == []
+
+
+@pytest.mark.parametrize("icon", ["task", "star", "home", "work", "shopping", "heart"])
+def test_supported_icons_and_update_title_boundary(client, icon):
+    original = client.post("/api/todos", json={"title": "Original", "icon": icon}).json()
+    response = client.put(f"/api/todos/{original['id']}", json={"title": "✓" * 500, "icon": icon})
+    assert response.status_code == 200
+    assert response.json() == {"id": original["id"], "title": "✓" * 500, "icon": icon}
