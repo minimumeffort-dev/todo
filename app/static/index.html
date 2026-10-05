@@ -20,20 +20,19 @@
         <label for="todo-title">What needs doing?</label>
         <div class="input-row">
           <input id="todo-title" name="title" placeholder="e.g. Pick up groceries" maxlength="500" required autocomplete="off" aria-describedby="error">
-          <div class="icon-field">
-            <label for="todo-icon">Icon</label>
-            <select id="todo-icon" name="icon"></select>
-          </div>
-          <button id="add-button" type="submit">Add task</button>
+          <label class="sr-only" for="todo-icon">Optional icon</label>
+          <select id="todo-icon" name="icon" aria-label="Optional icon"></select>
+          <button id="add-button" type="submit">Add</button>
         </div>
       </form>
-      <p id="error" role="alert" hidden></p>
       <div class="list-heading">
         <h2>Tasks <span id="count">0</span></h2>
         <button id="refresh-button" class="secondary" type="button">Refresh</button>
       </div>
       <p id="status" role="status">Loading your tasks…</p>
+      <p id="edit-help">Edit a title here. Enter or leaving the field saves; Escape cancels. Choose an icon to change it.</p>
       <ul id="todo-list" aria-label="Tasks"></ul>
+      <p id="error" role="alert" hidden></p>
     </section>
     <footer>Stored locally on this computer.</footer>
   </main>
