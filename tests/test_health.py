@@ -22,7 +22,7 @@ def test_health_without_database_access(tmp_path, monkeypatch):
     database = tmp_path / "todos.duckdb"
     application = create_app(database)
     blocked_calls = []
-    for method in ("open", "close", "_db", "list", "add", "delete"):
+    for method in ("open", "close", "_db", "list", "add", "update", "delete"):
         blocked = Mock(side_effect=AssertionError("Health must not access storage"))
         monkeypatch.setattr(application.state.store, method, blocked)
         blocked_calls.append(blocked)
