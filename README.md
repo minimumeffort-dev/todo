@@ -24,15 +24,20 @@ use `.venv/bin/python -m pip install -e .` instead.
 ```
 
 Open <http://127.0.0.1:8000> in a browser with JavaScript enabled. Type a task
-and choose an icon (Task, Star, Home, Work, Shopping, or Heart), then choose
-**Add task**, or press Enter. Choose **Edit** beside a task to change its title
-and icon, then **Save** to keep the changes or **Cancel** to discard them.
-While editing, finish with Save or Cancel before adding or refreshing tasks.
-Failed saves preserve both edited fields so you can retry. Icons and edits
-remain after refreshing the page or restarting the app.
-Choose **Remove** beside a task to
-delete it. **Refresh** reloads the list, including changes from other tabs.
-Failed requests display an error and preserve your input or existing task.
+and press Enter or choose **Add**. An icon is optional; Task is the default.
+The quick-add field stays ready for the next task.
+
+Click or Tab to a task title to edit it directly. Press Enter or leave the field
+to save; Escape discards the unsaved title and icon changes. Choose an icon in
+the row to save it immediately. Failed saves keep your draft: press Enter or
+leave the title field again to retry. Other rows and quick-add remain available.
+Choose the **×** button (announced as “Remove” and the task title) to remove a
+task in one step. Keyboard focus moves to the next task, the previous task, or
+the quick-add field when the list is empty. Removal is immediate.
+
+**Refresh** reloads tasks, including changes from other tabs, while preserving
+unsaved row drafts. Failed requests display an error and preserve your input
+or existing task. Saved titles and icons remain after reloading or restarting.
 Stop the server with Ctrl+C.
 
 ## Storage
