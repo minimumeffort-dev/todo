@@ -50,6 +50,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     application = FastAPI(title="Local To-do", lifespan=lifespan)
     application.state.store = store
 
+    @application.get("/health")
+    def health():
+        return {"status": "ok"}
+
     @application.get("/api/todos", response_model=list[Todo])
     def list_todos():
         return store.list()

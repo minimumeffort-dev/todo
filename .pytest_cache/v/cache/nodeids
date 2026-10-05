@@ -1,4 +1,6 @@
 [
+  "tests/test_health.py::test_health_response",
+  "tests/test_health.py::test_health_without_database_access",
   "tests/test_todos.py::test_add_list_and_remove",
   "tests/test_todos.py::test_delete_unknown_or_already_removed_item",
   "tests/test_todos.py::test_edit_preserves_identity_order_and_persists",
