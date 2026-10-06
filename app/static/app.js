@@ -139,6 +139,14 @@ function makeRow(item) {
   const row = document.createElement('li');
   row.className = 'task-row';
   row.dataset.id = item.id;
+  const completionControl = document.createElement('label');
+  completionControl.className = 'completion-control';
+  const completion = document.createElement('input');
+  completion.type = 'checkbox';
+  completion.className = 'task-completion';
+  const completionLabel = document.createElement('span');
+  completionLabel.className = 'sr-only';
+  completionControl.append(completion, completionLabel);
   const iconContainer = document.createElement('div');
   iconContainer.className = 'icon-control';
   const content = document.createElement('div');
@@ -165,8 +173,10 @@ function makeRow(item) {
   rowStatus.hidden = true;
   editor.setAttribute('aria-describedby', `edit-help ${message.id}`);
   title.setAttribute('aria-describedby', 'edit-help');
-  const state = { row, title, editor, remove, item, draft: { title: item.title, icon: item.icon },
-    editing: false, composing: false, pending: false, removingIntent: false, failedAction: 'save' };
+  completion.setAttribute('aria-describedby', message.id);
+  const state = { row, title, editor, completion, remove, item, draft: { title: item.title, icon: item.icon },
+    editing: false, composing: false, pending: false, removingIntent: false,
+    failedAction: 'save', failedCompletion: null };
   rows.set(item.id, state);
   const icon = makeIconControl(iconContainer, item.icon, `Icon for ${item.title}`, value => {
     state.draft.icon = value;
@@ -175,13 +185,21 @@ function makeRow(item) {
   });
   state.icon = icon;
   function labels() {
+    completion.checked = state.item.completed;
+    completionLabel.textContent = `Completed: ${state.item.title}`;
+    row.classList.toggle('is-completed', state.item.completed);
     title.textContent = state.item.title;
     title.setAttribute('aria-label', `Edit ${state.item.title}`);
     remove.setAttribute('aria-label', `Remove ${state.item.title}`);
-    retry.setAttribute('aria-label', `Retry ${state.failedAction === 'remove' ? 'removing' : 'saving'} ${state.item.title}`);
+    const retryAction = state.failedAction === 'remove' ? 'removing'
+      : state.failedAction === 'complete' ? (state.failedCompletion ? 'completing' : 'reopening') : 'saving';
+    retry.setAttribute('aria-label', `Retry ${retryAction} ${state.item.title}`);
     icon.update(state.draft.icon, `Icon for ${state.item.title}`);
   }
-  state.sync = () => { editor.value = state.draft.title; labels(); };
+  state.sync = () => {
+    if (editor.value !== state.draft.title) editor.value = state.draft.title;
+    labels();
+  };
   function rowError(text = '', action = 'save') {
     state.failedAction = action;
     message.textContent = text;
@@ -189,15 +207,17 @@ function makeRow(item) {
     editor.setAttribute('aria-invalid', String(Boolean(text) && action === 'save'));
     labels();
   }
-  function pending(action) {
+  function pending(action, completed) {
     state.pending = action;
     row.setAttribute('aria-busy', String(Boolean(action)));
     editor.readOnly = Boolean(action);
     title.disabled = Boolean(action);
+    completion.disabled = Boolean(action);
     icon.trigger.disabled = Boolean(action);
     remove.disabled = Boolean(action);
     retry.disabled = Boolean(action);
-    rowStatus.textContent = action === 'remove' ? 'Removing…' : 'Saving…';
+    rowStatus.textContent = action === 'remove' ? 'Removing…'
+      : action === 'complete' ? (completed ? 'Marking done…' : 'Reopening…') : 'Saving…';
     rowStatus.hidden = !action;
     updateRefresh();
   }
@@ -254,6 +274,31 @@ function makeRow(item) {
       }
     }
   }
+  async function setCompleted(desired) {
+    if (state.pending) return;
+    const focusedControl = document.activeElement;
+    pending('complete', desired);
+    icon.close();
+    revision++;
+    rowError();
+    completion.checked = desired;
+    try {
+      state.item = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ completed: desired }),
+      });
+      // Completion changes the saved item without submitting or discarding drafts.
+      labels();
+    } catch (exception) {
+      state.failedCompletion = desired;
+      rowError(exception.message, 'complete');
+    } finally {
+      pending(false);
+      if (document.activeElement === document.body && [completion, retry].includes(focusedControl)) {
+        (focusedControl === retry && feedback.hidden ? completion : focusedControl).focus();
+      }
+    }
+  }
   async function removeItem() {
     if (state.pending) return;
     const hadFocus = row.contains(document.activeElement) || state.removingHadFocus;
@@ -282,6 +327,7 @@ function makeRow(item) {
     finally { state.removingIntent = false; state.removingHadFocus = false; pending(false); }
   }
   title.addEventListener('click', startEditing);
+  completion.addEventListener('change', () => setCompleted(completion.checked));
   editor.addEventListener('input', () => { state.draft.title = editor.value; revision++; });
   editor.addEventListener('compositionstart', () => { state.composing = true; });
   editor.addEventListener('compositionend', () => { state.composing = false; state.draft.title = editor.value; revision++; });
@@ -298,7 +344,7 @@ function makeRow(item) {
     }
   });
   row.addEventListener('focusout', event => {
-    // Moving to this row's picker or remove button must not start a competing save.
+    // Moving to this row's controls must not start a competing save.
     if (!state.editing || state.pending || state.removingIntent || row.contains(event.relatedTarget)
       || event.relatedTarget === refreshButton) return;
     save();
@@ -313,11 +359,15 @@ function makeRow(item) {
     });
   }
   remove.addEventListener('click', removeItem);
-  retry.addEventListener('click', () => state.failedAction === 'remove' ? removeItem() : save());
+  retry.addEventListener('click', () => {
+    if (state.failedAction === 'remove') removeItem();
+    else if (state.failedAction === 'complete') setCompleted(state.failedCompletion);
+    else save();
+  });
   state.sync();
   feedback.append(message, retry);
   content.append(title, editor);
-  row.append(iconContainer, content, remove, rowStatus, feedback);
+  row.append(completionControl, iconContainer, content, remove, rowStatus, feedback);
   list.append(row);
 }
 
@@ -333,11 +383,19 @@ async function loadItems() {
     const byId = new Map(items.map(item => [item.id, item]));
     for (const [id, state] of rows) {
       const dirty = state.draft.title !== state.item.title || state.draft.icon !== state.item.icon;
-      if (state.pending || state.editing || dirty || state.row.contains(document.activeElement)) continue;
-      if (!byId.has(id)) { state.icon.close(); state.row.remove(); rows.delete(id); }
+      const preserveDraft = state.editing || dirty || state.row.contains(document.activeElement);
+      if (state.pending) continue;
+      if (!byId.has(id)) {
+        if (preserveDraft) continue;
+        state.icon.close(); state.row.remove(); rows.delete(id);
+      }
       else {
-        state.item = byId.get(id);
-        state.draft = { title: state.item.title, icon: state.item.icon };
+        const updated = byId.get(id);
+        if (preserveDraft) state.item = { ...state.item, completed: updated.completed };
+        else {
+          state.item = updated;
+          state.draft = { title: updated.title, icon: updated.icon };
+        }
         state.sync();
       }
     }

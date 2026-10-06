@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator
 
 from app.db import DEFAULT_ICON, TodoStore
 
@@ -29,10 +29,15 @@ class TodoUpdate(TodoInput):
     icon: TodoIcon
 
 
+class TodoCompletion(BaseModel):
+    completed: StrictBool
+
+
 class Todo(BaseModel):
     id: str
     title: str
     icon: TodoIcon
+    completed: bool
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
@@ -65,6 +70,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @application.put("/api/todos/{item_id}", response_model=Todo)
     def update_todo(item_id: str, item: TodoUpdate):
         updated = store.update(item_id, item.title, item.icon)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="To-do item not found")
+        return updated
+
+    @application.patch("/api/todos/{item_id}", response_model=Todo)
+    def set_todo_completed(item_id: str, item: TodoCompletion):
+        updated = store.set_completed(item_id, item.completed)
         if updated is None:
             raise HTTPException(status_code=404, detail="To-do item not found")
         return updated

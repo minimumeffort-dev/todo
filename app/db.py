@@ -29,6 +29,10 @@ class TodoStore:
                     "ALTER TABLE todos ADD COLUMN IF NOT EXISTS icon "
                     "VARCHAR DEFAULT 'task'"
                 )
+                connection.execute(
+                    "ALTER TABLE todos ADD COLUMN IF NOT EXISTS completed "
+                    "BOOLEAN DEFAULT false"
+                )
             except Exception:
                 connection.close()
                 raise
@@ -45,15 +49,18 @@ class TodoStore:
             raise RuntimeError("Todo storage is not open")
         return self._connection
 
-    def list(self) -> list[dict[str, str]]:
+    def list(self) -> list[dict[str, str | bool]]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT id, title, icon FROM todos ORDER BY created_at, id"
+                "SELECT id, title, icon, completed FROM todos ORDER BY created_at, id"
             ).fetchall()
-        return [{"id": row[0], "title": row[1], "icon": row[2]} for row in rows]
+        return [
+            {"id": row[0], "title": row[1], "icon": row[2], "completed": row[3]}
+            for row in rows
+        ]
 
-    def add(self, title: str, icon: str = DEFAULT_ICON) -> dict[str, str]:
-        item = {"id": str(uuid4()), "title": title, "icon": icon}
+    def add(self, title: str, icon: str = DEFAULT_ICON) -> dict[str, str | bool]:
+        item = {"id": str(uuid4()), "title": title, "icon": icon, "completed": False}
         with self._lock:
             self._db().execute(
                 "INSERT INTO todos (id, title, icon) VALUES (?, ?, ?)",
@@ -61,13 +68,27 @@ class TodoStore:
             )
         return item
 
-    def update(self, item_id: str, title: str, icon: str) -> dict[str, str] | None:
+    def update(self, item_id: str, title: str, icon: str) -> dict[str, str | bool] | None:
         with self._lock:
             row = self._db().execute(
                 "UPDATE todos SET title = ?, icon = ? WHERE id = ? "
-                "RETURNING id, title, icon", [title, icon, item_id]
+                "RETURNING id, title, icon, completed", [title, icon, item_id]
             ).fetchone()
-        return {"id": row[0], "title": row[1], "icon": row[2]} if row else None
+        return (
+            {"id": row[0], "title": row[1], "icon": row[2], "completed": row[3]}
+            if row else None
+        )
+
+    def set_completed(self, item_id: str, completed: bool) -> dict[str, str | bool] | None:
+        with self._lock:
+            row = self._db().execute(
+                "UPDATE todos SET completed = ? WHERE id = ? "
+                "RETURNING id, title, icon, completed", [completed, item_id]
+            ).fetchone()
+        return (
+            {"id": row[0], "title": row[1], "icon": row[2], "completed": row[3]}
+            if row else None
+        )
 
     def delete(self, item_id: str) -> bool:
         with self._lock:
