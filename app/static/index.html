@@ -10,29 +10,28 @@
 <body>
   <main>
     <header>
-      <p class="eyebrow">ONE THING AT A TIME</p>
+      <p class="eyebrow">YOUR SPACE</p>
       <h1>Your to-do list</h1>
-      <p>Make a little room for what matters. Add a task, update it as plans change, then remove it when you're done.</p>
+      <p>A little room for what matters.</p>
     </header>
     <section class="card" aria-label="To-do items">
       <noscript><p>This page needs JavaScript to load, add, edit, and remove your tasks. Enable JavaScript and reload the page.</p></noscript>
-      <form id="todo-form">
-        <label for="todo-title">What needs doing?</label>
-        <div class="input-row">
-          <input id="todo-title" name="title" placeholder="e.g. Pick up groceries" maxlength="500" required autocomplete="off" aria-describedby="error">
-          <label class="sr-only" for="todo-icon">Optional icon</label>
-          <select id="todo-icon" name="icon" aria-label="Optional icon"></select>
-          <button id="add-button" type="submit">Add</button>
-        </div>
-      </form>
       <div class="list-heading">
         <h2>Tasks <span id="count">0</span></h2>
         <button id="refresh-button" class="secondary" type="button">Refresh</button>
       </div>
       <p id="status" role="status">Loading your tasks…</p>
-      <p id="edit-help">Edit a title here. Enter or leaving the field saves; Escape cancels. Choose an icon to change it.</p>
       <ul id="todo-list" aria-label="Tasks"></ul>
-      <p id="error" role="alert" hidden></p>
+      <button id="new-task" class="new-task" type="button" aria-expanded="false" aria-controls="todo-form"><span aria-hidden="true">＋</span> New task</button>
+      <form id="todo-form" class="composer" aria-label="New task" hidden novalidate>
+        <div id="composer-icon" class="icon-control"></div>
+        <label class="sr-only" for="todo-title">New task title</label>
+        <input id="todo-title" name="title" class="inline-editor" placeholder="Write a task…" maxlength="500" autocomplete="off" aria-describedby="edit-help error">
+        <button id="add-button" class="secondary" type="submit">Add</button>
+        <button id="cancel-add" class="quiet-button" type="button" aria-label="Cancel new task">×</button>
+      </form>
+      <p id="error" class="error" role="alert" hidden></p>
+      <p id="edit-help">Click a task to edit. Enter saves · Escape cancels.</p>
     </section>
     <footer>Stored locally on this computer.</footer>
   </main>

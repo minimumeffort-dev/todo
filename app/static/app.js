@@ -1,23 +1,35 @@
 const form = document.querySelector('#todo-form');
 const input = document.querySelector('#todo-title');
-const iconInput = document.querySelector('#todo-icon');
 const addButton = document.querySelector('#add-button');
+const newTask = document.querySelector('#new-task');
+const cancelAdd = document.querySelector('#cancel-add');
 const refreshButton = document.querySelector('#refresh-button');
 const list = document.querySelector('#todo-list');
 const count = document.querySelector('#count');
 const status = document.querySelector('#status');
 const error = document.querySelector('#error');
-const icons = { task: '✓ Task', star: '★ Star', home: '⌂ Home', work: '▣ Work', shopping: '🛒 Shopping', heart: '♥ Heart' };
+// Keep controls available on touch devices even when a keyboard or mouse is used.
+document.documentElement.classList.toggle('touch-device', navigator.maxTouchPoints > 0);
+const icons = {
+  task: ['✓', 'Task'], star: ['★', 'Star'], home: ['⌂', 'Home'],
+  work: ['▣', 'Work'], shopping: ['🛒', 'Shopping'], heart: ['♥', 'Heart'],
+};
 const rows = new Map();
 let adding = false;
 let loading = false;
 let revision = 0;
-function fillIcons(select, selected = 'task') {
-  for (const [value, label] of Object.entries(icons)) {
-    select.add(new Option(label, value, false, value === selected));
-  }
+let composerIcon = 'task';
+let composerComposing = false;
+let openPicker = null;
+let pickerSequence = 0;
+
+function button(className, label) {
+  const element = document.createElement('button');
+  element.type = 'button';
+  element.className = className;
+  element.textContent = label;
+  return element;
 }
-fillIcons(iconInput);
 function showError(message = '') {
   error.textContent = message;
   error.hidden = !message;
@@ -33,117 +45,300 @@ async function request(url, options = {}) {
   }
   return response.status === 204 ? null : response.json();
 }
+function updateRefresh() {
+  refreshButton.disabled = loading || adding || [...rows.values()].some(state => state.pending);
+}
 function updateCount() {
   count.textContent = rows.size;
   status.textContent = 'Your list is clear. Add a task to get started.';
   status.hidden = rows.size > 0;
 }
-function makeRow(item) {
-  const row = document.createElement('li');
-  const title = document.createElement('input');
-  title.className = 'task-title';
-  title.value = item.title;
-  title.maxLength = 500;
-  title.required = true;
-  title.setAttribute('aria-label', 'Task title');
-  title.setAttribute('aria-describedby', 'edit-help error');
-  const icon = document.createElement('select');
-  icon.className = 'task-icon';
-  icon.setAttribute('aria-label', `Icon for ${item.title}`);
-  fillIcons(icon, item.icon);
-  const remove = document.createElement('button');
-  remove.type = 'button';
-  remove.className = 'remove';
-  remove.textContent = '×';
-  remove.setAttribute('aria-label', `Remove ${item.title}`);
-  const state = { row, title, icon, remove, item, pending: false };
-  rows.set(item.id, state);
-  function pending(value) {
-    state.pending = value;
-    row.setAttribute('aria-busy', String(value));
-    title.readOnly = value;
-    icon.disabled = value;
-    remove.disabled = value;
+
+// A small, keyboard-accessible picker shared by rows and the composer.
+function makeIconControl(container, selected, label, onSelect) {
+  const trigger = button('icon-button', '');
+  trigger.setAttribute('aria-haspopup', 'dialog');
+  trigger.setAttribute('aria-expanded', 'false');
+  const picker = document.createElement('div');
+  picker.className = 'icon-picker';
+  picker.id = `icon-picker-${++pickerSequence}`;
+  picker.hidden = true;
+  picker.setAttribute('role', 'dialog');
+  picker.setAttribute('aria-label', 'Choose an icon');
+  trigger.setAttribute('aria-controls', picker.id);
+  const heading = document.createElement('p');
+  heading.className = 'picker-label';
+  heading.textContent = 'Choose an icon';
+  const options = document.createElement('div');
+  options.className = 'picker-options';
+  const choices = [];
+  let value = selected;
+  function close(restoreFocus = false) {
+    picker.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    if (openPicker === control) openPicker = null;
+    if (restoreFocus) trigger.focus();
   }
-  async function save() {
-    if (state.pending) return;
-    const draft = title.value.trim();
-    if (draft === state.item.title && icon.value === state.item.icon) return;
-    if (!draft) { showError('Enter a task title before saving it.'); return; }
-    pending(true);
-    revision++;
-    showError();
-    try {
-      const updated = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: draft, icon: icon.value }),
-      });
-      state.item = updated;
-      title.value = updated.title;
-      remove.setAttribute('aria-label', `Remove ${updated.title}`);
-      icon.setAttribute('aria-label', `Icon for ${updated.title}`);
-    } catch (exception) { showError(exception.message); }
-    finally { pending(false); }
+  function update(next, accessibleLabel = label) {
+    value = next;
+    trigger.textContent = icons[next][0];
+    trigger.setAttribute('aria-label', `${accessibleLabel}, ${icons[next][1]} icon`);
+    for (const choice of choices) choice.setAttribute('aria-pressed', String(choice.dataset.icon === next));
   }
-  title.addEventListener('blur', event => {
-    // Removing this row should not issue a competing save request.
-    if (event.relatedTarget !== remove) save();
+  for (const [key, [symbol, name]] of Object.entries(icons)) {
+    const choice = button('icon-option', '');
+    choice.dataset.icon = key;
+    choice.setAttribute('aria-label', name);
+    const glyph = document.createElement('span');
+    glyph.className = 'option-symbol';
+    glyph.setAttribute('aria-hidden', 'true');
+    glyph.textContent = symbol;
+    choice.append(glyph, document.createTextNode(name));
+    choice.addEventListener('click', () => {
+      close(true);
+      update(key);
+      onSelect(key);
+    });
+    choices.push(choice);
+    options.append(choice);
+  }
+  const control = { trigger, picker, close, update, container };
+  update(value);
+  trigger.addEventListener('click', () => {
+    if (!picker.hidden) { close(true); return; }
+    openPicker?.close();
+    openPicker = control;
+    picker.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    choices.find(choice => choice.dataset.icon === value).focus();
   });
-  title.addEventListener('keydown', event => {
-    if (event.isComposing) return;
-    if (event.key === 'Enter') { event.preventDefault(); save(); }
-    if (event.key === 'Escape' && !state.pending) {
-      title.value = state.item.title;
-      icon.value = state.item.icon;
-      showError();
+  picker.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(true); }
+    const directions = { ArrowRight: 1, ArrowDown: 2, ArrowLeft: -1, ArrowUp: -2 };
+    const index = choices.indexOf(document.activeElement);
+    if (index < 0) return;
+    if (event.key in directions || event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? choices.length - 1
+        : (index + directions[event.key] + choices.length) % choices.length;
+      choices[next].focus();
     }
   });
-  icon.addEventListener('change', save);
-  remove.addEventListener('click', async () => {
-    if (state.pending) return;
-    const hadFocus = row.contains(document.activeElement);
-    pending(true);
+  container.addEventListener('focusout', event => {
+    if (!container.contains(event.relatedTarget)) close();
+  });
+  picker.append(heading, options);
+  container.append(trigger, picker);
+  return control;
+}
+document.addEventListener('pointerdown', event => {
+  if (openPicker && !openPicker.container.contains(event.target)) openPicker.close();
+});
+
+function makeRow(item) {
+  const row = document.createElement('li');
+  row.className = 'task-row';
+  row.dataset.id = item.id;
+  const iconContainer = document.createElement('div');
+  iconContainer.className = 'icon-control';
+  const content = document.createElement('div');
+  content.className = 'title-content';
+  const title = button('task-title', item.title);
+  const editor = document.createElement('input');
+  editor.className = 'inline-editor task-editor';
+  editor.maxLength = 500;
+  editor.autocomplete = 'off';
+  editor.hidden = true;
+  editor.setAttribute('aria-label', 'Task title');
+  const remove = button('quiet-button remove', '×');
+  const feedback = document.createElement('div');
+  feedback.className = 'row-feedback';
+  feedback.hidden = true;
+  const message = document.createElement('p');
+  message.className = 'error';
+  message.id = `row-error-${item.id}`;
+  message.setAttribute('role', 'alert');
+  const retry = button('retry', 'Retry');
+  const rowStatus = document.createElement('p');
+  rowStatus.className = 'row-status';
+  rowStatus.setAttribute('role', 'status');
+  rowStatus.hidden = true;
+  editor.setAttribute('aria-describedby', `edit-help ${message.id}`);
+  title.setAttribute('aria-describedby', 'edit-help');
+  const state = { row, title, editor, remove, item, draft: { title: item.title, icon: item.icon },
+    editing: false, composing: false, pending: false, removingIntent: false, failedAction: 'save' };
+  rows.set(item.id, state);
+  const icon = makeIconControl(iconContainer, item.icon, `Icon for ${item.title}`, value => {
+    state.draft.icon = value;
     revision++;
-    showError();
+    save();
+  });
+  state.icon = icon;
+  function labels() {
+    title.textContent = state.item.title;
+    title.setAttribute('aria-label', `Edit ${state.item.title}`);
+    remove.setAttribute('aria-label', `Remove ${state.item.title}`);
+    retry.setAttribute('aria-label', `Retry ${state.failedAction === 'remove' ? 'removing' : 'saving'} ${state.item.title}`);
+    icon.update(state.draft.icon, `Icon for ${state.item.title}`);
+  }
+  state.sync = () => { editor.value = state.draft.title; labels(); };
+  function rowError(text = '', action = 'save') {
+    state.failedAction = action;
+    message.textContent = text;
+    feedback.hidden = !text;
+    editor.setAttribute('aria-invalid', String(Boolean(text) && action === 'save'));
+    labels();
+  }
+  function pending(action) {
+    state.pending = action;
+    row.setAttribute('aria-busy', String(Boolean(action)));
+    editor.readOnly = Boolean(action);
+    title.disabled = Boolean(action);
+    icon.trigger.disabled = Boolean(action);
+    remove.disabled = Boolean(action);
+    retry.disabled = Boolean(action);
+    rowStatus.textContent = action === 'remove' ? 'Removing…' : 'Saving…';
+    rowStatus.hidden = !action;
+    updateRefresh();
+  }
+  function finishEditing(restoreFocus = false) {
+    state.editing = false;
+    editor.hidden = true;
+    title.hidden = false;
+    if (restoreFocus) title.focus();
+  }
+  function startEditing() {
+    if (state.pending) return;
+    editor.value = state.draft.title;
+    title.hidden = true;
+    editor.hidden = false;
+    editor.focus();
+    // Hiding the focused title can fire focusout before the editor receives focus.
+    state.editing = true;
+    editor.setSelectionRange(editor.value.length, editor.value.length);
+  }
+  async function save() {
+    if (state.pending || state.composing) return;
+    const draft = { title: state.draft.title.trim(), icon: state.draft.icon };
+    if (!draft.title || draft.title.length > 500) {
+      rowError('Use a title with 1–500 characters.');
+      return;
+    }
+    if (draft.title === state.item.title && draft.icon === state.item.icon) {
+      state.draft = { title: state.item.title, icon: state.item.icon };
+      rowError();
+      finishEditing(document.activeElement === editor);
+      return;
+    }
+    const focusedControl = document.activeElement;
+    pending('save');
+    icon.close();
+    revision++;
+    rowError();
+    try {
+      const updated = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
+      });
+      state.item = updated;
+      state.draft = { title: updated.title, icon: updated.icon };
+      state.sync();
+      // Restore focus only if the user has stayed in this editor.
+      const restoreFocus = document.activeElement === editor;
+      pending(false);
+      finishEditing(restoreFocus);
+    } catch (exception) { rowError(exception.message); }
+    finally {
+      pending(false);
+      if (document.activeElement === document.body && [icon.trigger, retry].includes(focusedControl)) {
+        (focusedControl === retry && feedback.hidden ? title : focusedControl).focus();
+      }
+    }
+  }
+  async function removeItem() {
+    if (state.pending) return;
+    const hadFocus = row.contains(document.activeElement) || state.removingHadFocus;
+    pending('remove');
+    icon.close();
+    revision++;
+    rowError();
     try {
       await request(`/api/todos/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
-      const next = row.nextElementSibling || row.previousElementSibling;
+      const adjacent = [row.nextElementSibling, row.previousElementSibling]
+        .map(element => element && rows.get(element.dataset.id))
+        .find(candidate => candidate && (!candidate.pending || (candidate.editing && candidate.pending === 'save')));
       const restoreFocus = hadFocus && (row.contains(document.activeElement) || document.activeElement === document.body);
       rows.delete(item.id);
       row.remove();
       updateCount();
-      if (restoreFocus) (next?.querySelector('.task-title') || input).focus();
+      if (restoreFocus) {
+        if (adjacent) (adjacent.editing ? adjacent.editor : adjacent.title).focus();
+        else openComposer();
+      }
     } catch (exception) {
-      showError(exception.message);
+      rowError(exception.message, 'remove');
       pending(false);
       if (hadFocus && document.activeElement === document.body) remove.focus();
     }
-    finally { pending(false); }
+    finally { state.removingIntent = false; state.removingHadFocus = false; pending(false); }
+  }
+  title.addEventListener('click', startEditing);
+  editor.addEventListener('input', () => { state.draft.title = editor.value; revision++; });
+  editor.addEventListener('compositionstart', () => { state.composing = true; });
+  editor.addEventListener('compositionend', () => { state.composing = false; state.draft.title = editor.value; revision++; });
+  editor.addEventListener('keydown', event => {
+    if (event.isComposing || state.composing || event.keyCode === 229) return;
+    if (event.key === 'Enter') { event.preventDefault(); save(); }
+    if (event.key === 'Escape' && !state.pending) {
+      event.preventDefault();
+      state.draft = { title: state.item.title, icon: state.item.icon };
+      revision++;
+      rowError();
+      state.sync();
+      finishEditing(true);
+    }
   });
-  row.append(icon, title, remove);
+  row.addEventListener('focusout', event => {
+    // Moving to this row's picker or remove button must not start a competing save.
+    if (!state.editing || state.pending || state.removingIntent || row.contains(event.relatedTarget)
+      || event.relatedTarget === refreshButton) return;
+    save();
+  });
+  remove.addEventListener('pointerdown', () => {
+    state.removingIntent = true;
+    state.removingHadFocus = row.contains(document.activeElement) || document.activeElement === document.body;
+  });
+  for (const eventName of ['pointerup', 'pointercancel']) {
+    remove.addEventListener(eventName, () => {
+      setTimeout(() => { state.removingIntent = false; state.removingHadFocus = false; }, 0);
+    });
+  }
+  remove.addEventListener('click', removeItem);
+  retry.addEventListener('click', () => state.failedAction === 'remove' ? removeItem() : save());
+  state.sync();
+  feedback.append(message, retry);
+  content.append(title, editor);
+  row.append(iconContainer, content, remove, rowStatus, feedback);
   list.append(row);
 }
+
 async function loadItems() {
   if (loading || adding || [...rows.values()].some(state => state.pending)) return;
   const snapshot = revision;
   loading = true;
-  refreshButton.disabled = true;
+  updateRefresh();
   showError();
   try {
     const items = await request('/api/todos');
     if (snapshot !== revision) return;
-    const ids = new Set(items.map(item => item.id));
+    const byId = new Map(items.map(item => [item.id, item]));
     for (const [id, state] of rows) {
-      const dirty = state.title.value !== state.item.title || state.icon.value !== state.item.icon;
-      if (state.pending || dirty) continue;
-      if (!ids.has(id)) { state.row.remove(); rows.delete(id); }
+      const dirty = state.draft.title !== state.item.title || state.draft.icon !== state.item.icon;
+      if (state.pending || state.editing || dirty || state.row.contains(document.activeElement)) continue;
+      if (!byId.has(id)) { state.icon.close(); state.row.remove(); rows.delete(id); }
       else {
-        const updated = items.find(item => item.id === id);
-        state.item = updated;
-        state.title.value = updated.title;
-        state.icon.value = updated.icon;
-        state.remove.setAttribute('aria-label', `Remove ${updated.title}`);
-        state.icon.setAttribute('aria-label', `Icon for ${updated.title}`);
+        state.item = byId.get(id);
+        state.draft = { title: state.item.title, icon: state.item.icon };
+        state.sync();
       }
     }
     for (const item of items) if (!rows.has(item.id)) makeRow(item);
@@ -152,37 +347,84 @@ async function loadItems() {
     showError(exception.message);
     if (!rows.size) { status.textContent = 'Could not load your tasks. Try Refresh.'; status.hidden = false; }
   }
-  finally { loading = false; refreshButton.disabled = false; }
+  finally { loading = false; updateRefresh(); }
 }
+const composerPicker = makeIconControl(document.querySelector('#composer-icon'), 'task', 'New task icon', value => {
+  composerIcon = value;
+  input.focus();
+});
+function openComposer() {
+  form.hidden = false;
+  newTask.hidden = true;
+  newTask.setAttribute('aria-expanded', 'true');
+  input.focus();
+}
+function closeComposer() {
+  if (adding) return;
+  composerPicker.close();
+  input.value = '';
+  composerIcon = 'task';
+  composerPicker.update('task');
+  showError();
+  input.setAttribute('aria-invalid', 'false');
+  form.hidden = true;
+  newTask.hidden = false;
+  newTask.setAttribute('aria-expanded', 'false');
+  newTask.focus();
+}
+newTask.addEventListener('click', openComposer);
+cancelAdd.addEventListener('click', closeComposer);
+input.addEventListener('compositionstart', () => { composerComposing = true; });
+input.addEventListener('compositionend', () => { composerComposing = false; });
+input.addEventListener('keydown', event => {
+  if (event.isComposing || composerComposing || event.keyCode === 229) {
+    if (event.key === 'Enter') event.preventDefault();
+    return;
+  }
+  if (event.key === 'Escape') { event.preventDefault(); closeComposer(); }
+});
 form.addEventListener('submit', async event => {
   event.preventDefault();
-  if (adding) return;
+  if (adding || composerComposing) return;
   const title = input.value.trim();
-  if (!title) { showError('Enter a task before adding it.'); input.focus(); return; }
+  if (!title || title.length > 500) {
+    showError('Use a title with 1–500 characters.');
+    input.setAttribute('aria-invalid', 'true');
+    input.focus();
+    return;
+  }
   adding = true;
   revision++;
   input.readOnly = true;
-  iconInput.disabled = true;
+  composerPicker.trigger.disabled = true;
+  composerPicker.close();
   addButton.disabled = true;
+  cancelAdd.disabled = true;
   form.setAttribute('aria-busy', 'true');
+  input.setAttribute('aria-invalid', 'false');
+  updateRefresh();
   showError();
   try {
     const item = await request('/api/todos', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title, icon: iconInput.value }),
+      body: JSON.stringify({ title, icon: composerIcon }),
     });
     if (!rows.has(item.id)) makeRow(item);
     input.value = '';
-    iconInput.value = 'task';
+    composerIcon = 'task';
+    composerPicker.update('task');
     updateCount();
   } catch (exception) { showError(exception.message); }
   finally {
     adding = false;
     input.readOnly = false;
-    iconInput.disabled = false;
+    composerPicker.trigger.disabled = false;
     addButton.disabled = false;
+    cancelAdd.disabled = false;
     form.setAttribute('aria-busy', 'false');
-    input.focus();
+    updateRefresh();
+    // Keep consecutive entry convenient without stealing focus from another row.
+    if (form.contains(document.activeElement) || document.activeElement === document.body) input.focus();
   }
 });
 refreshButton.addEventListener('click', loadItems);
