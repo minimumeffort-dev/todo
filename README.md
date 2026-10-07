@@ -59,6 +59,50 @@ edited. Failed requests display an error and preserve your input or existing tas
 Saved titles, icons, and completion states remain after reloading or restarting.
 Stop the server with Ctrl+C.
 
+## Run EmbeddingGemma 2
+
+Choose **Load and test model** in the **On-device model** panel. This loads the
+model on demand in a module worker and runs a built-in sample sentence on
+WebGPU. **Model ready** means inference succeeded with finite, nonzero output.
+The sample output is validated and discarded. Task titles and drafts are never
+sent to the model. Uploads, task embeddings, vector storage, and search are
+reserved for future work.
+
+The model panel shows indeterminate progress during setup and a percentage
+when the download total is available. **Retry** starts a fresh worker after a
+loading or inference failure. Tasks remain usable during model loading, testing,
+and errors.
+
+Use a current WebGPU-capable browser with WebGPU available in module workers,
+hardware acceleration, and enough GPU memory. Serve the app on **HTTPS or
+localhost**. The panel explains when WebGPU or a GPU adapter is unavailable.
+The test uses the WebGPU backend; support depends on the browser, OS, and GPU.
+
+The verified pins are:
+
+| Component | Pin |
+| --- | --- |
+| Model | [onnx-community/embeddinggemma-2-ONNX](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/tree/daa72c51243991dfcaf9f9137d2c573d8f7790c0) |
+| Immutable revision | `daa72c51243991dfcaf9f9137d2c573d8f7790c0` |
+| Browser weights | `q4`: `onnx/model_q4.onnx` and `onnx/model_q4.onnx_data` |
+| Transformers.js | `4.3.1` |
+| ONNX Runtime Web dependency | `1.31.0-dev.20260914-8d85527a0` |
+
+This fixed text test loads the text encoder and tokenizer. Vision and audio
+encoder configs are disabled. All model and tokenizer requests, including
+metadata probes, use the pinned revision.
+
+The first activation fetches approximately **234 MB of uncompressed assets**:
+about 175 MB of model graph/weights, 32 MB of tokenizer data, and 27 MB of runtime
+files. Network transfer varies with compression and caching. Downloads use
+`huggingface.co`, its weight CDN `us.aws.cdn.hf.co`, and `cdn.jsdelivr.net`.
+Network access starts only after activation.
+
+Model assets use the browser's origin-scoped cache when available. Reloading
+releases the resident worker and returns the panel to its initial state;
+activation can reuse cached assets. Browser storage quotas, private browsing,
+cache eviction, or clearing site data may require another download.
+
 ## Storage
 
 The default database location is `data/todos.duckdb` under the project directory.
@@ -78,13 +122,62 @@ TODO_DB_PATH=/absolute/path/to/todos.duckdb .venv/bin/python -m uvicorn app.main
 ## Verify
 
 ```sh
-.venv/bin/python -m pytest tests/test_todos.py tests/test_health.py -q
+.venv/bin/python -m pip install 'setuptools>=68' wheel
+.venv/bin/python -m pytest tests/test_todos.py tests/test_health.py tests/test_model_assets.py -q
+mise exec node@22.20.0 -- node --test tests/model_runtime.test.mjs
 ```
 
 The API tests use temporary databases and cover adding, listing, editing,
 deleting, completing and reopening, invalid input, supported icons, missing
 items, legacy database upgrades, repeated completion requests, persistence
 across application restarts, and health checks without database access.
+Model asset checks also verify JavaScript serving, the panel's separate status
+elements, wheel packaging, and the offline worker lifecycle suite. These checks
+need Node 22. Install it with `mise install node@22.20.0` if needed. Browser
+integration checks are opt-in.
+
+To prepare reproducible browser checks, install Playwright and download the
+pinned fixtures (approximately 234 MB, stored under the ignored `.venv` folder):
+
+```sh
+mise install node@22.20.0
+mise exec node@22.20.0 -- npm install --prefix .venv/model-browser --no-audit --no-fund playwright@1.55.1
+mise exec node@22.20.0 -- node .venv/model-browser/node_modules/playwright/cli.js install chromium
+mise exec node@22.20.0 -- .venv/bin/python tests/test_model_assets.py --download-fixtures
+```
+
+Playwright reports any missing native Chromium libraries on Linux. The fixture
+preparation command verifies SHA-256 hashes before making downloads available
+to tests and reuses matching files on later runs.
+
+Run these checks separately; each starts and stops its own FastAPI server and
+browser using temporary databases and dynamically allocated loopback ports:
+
+```sh
+MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k real_model -q
+MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k failures_retry -q
+MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k external_weight -q
+MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k task_flows -q
+```
+
+The first two run the actual model in the production worker with authentic
+cached bytes. The tests raise the temporary browser cache quota to fit the
+fixtures and use Chromium's SwiftShader software WebGPU adapter in the Linux VM.
+They verify task interactions during loading and inference, draft preservation,
+blocked runtime/model-graph/external-weight downloads, unsupported WebGPU,
+retry, and cache reuse after reload. Fault tests reject downloads through browser
+routing and the SDK's fetch hook; they do not replace inference or its output.
+The third specifically checks that a failed external-weight download offers
+**Retry**, then verifies real inference succeeds after retry. The fourth checks
+task add/edit/complete/reopen/remove flows, completion failure/retry, and a
+narrow layout alongside the model panel.
+
+For a cold download check, set `MODEL_COLD_DOWNLOAD=1` on the `real_model` command;
+this uses the actual CDN requests and can take several minutes. In the managed
+VM, the check uses the provided network proxy for HTTPS and bypasses it for
+localhost. The cold run and cached inference checks were verified with
+Chromium 140 on the software WebGPU adapter. Physical GPU and browser performance
+will vary.
 
 For a browser check, start the app, add consecutive tasks, edit one by mouse
 and one by keyboard, and verify Enter/blur saving and Escape cancellation.

@@ -1,0 +1,208 @@
+// Verified against the repository's immutable configuration and model card:
+// embedding_gemma2, AutoTokenizer, text-only model_q4.onnx + its external data.
+// The model card recommends q4 on WebGPU; Transformers.js 4.3.1 supports this
+// architecture. Only a successful, validated inference can publish ready.
+export const MODEL_ARTIFACT = Object.freeze({
+  id: 'onnx-community/embeddinggemma-2-ONNX',
+  revision: 'daa72c51243991dfcaf9f9137d2c573d8f7790c0',
+  dtype: 'q4',
+});
+export const TRANSFORMERS_VERSION = '4.3.1';
+export const TRANSFORMERS_URL = `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/transformers.min.js`;
+const SAMPLE = 'A small test sentence for the local to-do model.';
+const SETUP_MESSAGE = 'EmbeddingGemma 2 setup is incomplete: its immutable ONNX revision, tokenizer and WebGPU weights must be verified before loading.';
+
+class ModelFailure extends Error {
+  constructor(phase, message) {
+    super(message);
+    this.phase = phase;
+  }
+}
+
+function validateEmbedding(output) {
+  const embedding = output?.sentence_embedding;
+  if (!embedding || !['float32', 'float64'].includes(embedding.type)
+    || embedding.dims?.length !== 2 || embedding.dims[0] !== 1
+    || !Number.isSafeInteger(embedding.dims[1]) || embedding.dims[1] < 1
+    || embedding.data?.length !== embedding.dims[1]) {
+    throw new ModelFailure('error', 'EmbeddingGemma 2 returned an invalid sample embedding. Please retry.');
+  }
+  let norm = 0;
+  for (const value of embedding.data) {
+    if (!Number.isFinite(value)) {
+      throw new ModelFailure('error', 'EmbeddingGemma 2 returned non-finite sample output. Please retry.');
+    }
+    norm += value * value;
+  }
+  if (!Number.isFinite(norm) || norm <= 0) {
+    throw new ModelFailure('error', 'EmbeddingGemma 2 returned an empty sample embedding. Please retry.');
+  }
+}
+
+function discardTensors(...collections) {
+  const tensors = new Set(collections.flatMap(collection => Object.values(collection ?? {})));
+  for (const tensor of tensors) {
+    try { tensor?.dispose?.(); } catch { /* Continue releasing the other outputs. */ }
+  }
+}
+
+async function loadModelWithRejections(load, errorEvents) {
+  let rejectFailure;
+  const failure = new Promise((_, reject) => { rejectFailure = reject; });
+  const onRejection = event => {
+    // Transformers.js 4.3.1's external-data loader uses an async Promise
+    // executor without forwarding its rejection. The outer model load hangs,
+    // but the worker still reports this event. Confine it to the model panel.
+    event.preventDefault?.();
+    rejectFailure(event.reason ?? new Error('Model loading failed'));
+  };
+  errorEvents.addEventListener?.('unhandledrejection', onRejection);
+  const pending = Promise.resolve().then(load);
+  let accepted = false;
+  try {
+    const model = await Promise.race([pending, failure]);
+    accepted = true;
+    return model;
+  } finally {
+    errorEvents.removeEventListener?.('unhandledrejection', onRejection);
+    // A load that finishes after failure must not retain its GPU resources.
+    if (!accepted) void pending.then(model => model?.dispose?.()).catch(() => {});
+  }
+}
+
+// Dependency injection keeps lifecycle tests offline; the deployed handler uses
+// the constants above and receives no runtime/model configuration from the UI.
+export function createModelWorker({
+  postMessage,
+  gpu = globalThis.navigator?.gpu,
+  importRuntime = () => import(TRANSFORMERS_URL),
+  artifact = MODEL_ARTIFACT,
+  errorEvents = globalThis,
+} = {}) {
+  let active = null;
+  let model = null;
+  let tokenizer = null;
+  let generation = 0;
+
+  async function releaseModel() {
+    const previous = model;
+    model = tokenizer = null;
+    try { await previous?.dispose(); } catch { /* Parent termination releases the worker context too. */ }
+  }
+
+  async function run(id, current) {
+    const emit = (phase, progress, message) => {
+      if (current === generation) postMessage({ id, phase, progress, message });
+    };
+    const checkCurrent = () => {
+      if (current !== generation) throw new Error('Cancelled');
+    };
+    let stage = 'runtime';
+    let inputs;
+    let output;
+    try {
+      await releaseModel();
+      checkCurrent();
+      if (artifact.id !== MODEL_ARTIFACT.id || !/^[a-f0-9]{40}$/.test(artifact.revision ?? '')
+        || !['fp32', 'fp16', 'q8', 'q4', 'q4f16'].includes(artifact.dtype)) {
+        throw new ModelFailure('error', SETUP_MESSAGE);
+      }
+      if (!gpu) throw new ModelFailure('unsupported', 'WebGPU is unavailable in this browser’s model worker. Use a WebGPU-capable browser on HTTPS or localhost.');
+      let adapter;
+      try { adapter = await gpu.requestAdapter(); } catch { /* Report unsupported below. */ }
+      checkCurrent();
+      if (!adapter) throw new ModelFailure('unsupported', 'No WebGPU adapter is available. Enable hardware acceleration or try another WebGPU-capable browser.');
+      if (['fp16', 'q4f16'].includes(artifact.dtype) && !adapter.features.has('shader-f16')) {
+        throw new ModelFailure('unsupported', 'These EmbeddingGemma 2 weights require WebGPU shader-f16 support. Use a compatible GPU and browser.');
+      }
+      emit('loading', null, 'Loading the pinned Transformers.js runtime…');
+      const { AutoConfig, AutoTokenizer, AutoModel, env } = await importRuntime();
+      checkCurrent();
+      if (env.version !== TRANSFORMERS_VERSION) throw new ModelFailure('error', 'The model runtime version does not match its pin. Reload and retry.');
+      env.allowLocalModels = false;
+      env.allowRemoteModels = true;
+      // 4.3.1's tokenizer existence probe omits its revision option. Pin the
+      // URL template too, so even metadata requests use the verified commit.
+      env.remotePathTemplate = `{model}/resolve/${artifact.revision}/`;
+      // Use the browser's usual origin-scoped cache when available.
+      env.useBrowserCache = typeof globalThis.caches !== 'undefined';
+      // Inference stays in this worker even when cross-origin isolation is absent.
+      env.backends.onnx.wasm.numThreads = 1;
+      env.backends.onnx.wasm.proxy = false;
+
+      const options = { revision: artifact.revision };
+      stage = 'configuration';
+      emit('loading', null, 'Loading the pinned EmbeddingGemma 2 configuration…');
+      const config = await AutoConfig.from_pretrained(artifact.id, options);
+      checkCurrent();
+      if (config.model_type !== 'embedding_gemma2' || !config.text_config) {
+        throw new ModelFailure('error', 'The pinned artifact is not a supported EmbeddingGemma 2 model. Model setup must be checked.');
+      }
+      // The published runtime explicitly supports text-only loading this way.
+      // No image/audio encoders or task content are needed for this fixed test.
+      config.vision_config = config.audio_config = null;
+      stage = 'tokenizer';
+      tokenizer = await AutoTokenizer.from_pretrained(artifact.id, options);
+      checkCurrent();
+      stage = 'model';
+      let lastProgressAt = 0;
+      let lastProgress = null;
+      model = await loadModelWithRejections(() => AutoModel.from_pretrained(artifact.id, {
+        ...options, config, device: 'webgpu', dtype: artifact.dtype,
+        progress_callback: info => {
+          if (info.status === 'progress_total') {
+            const progress = Number.isFinite(info.progress) && info.total > 0
+              ? Math.min(1, Math.max(0, info.progress / 100)) : null;
+            const now = Date.now();
+            // Limit chunk updates to keep task controls responsive during a
+            // large download, while preserving unknown totals and completion.
+            if (progress === null || lastProgress === null || progress === 1 || now - lastProgressAt >= 100) {
+              lastProgressAt = now;
+              lastProgress = progress;
+              emit('loading', progress, 'Downloading EmbeddingGemma 2 weights…');
+            }
+          }
+        },
+      }), errorEvents);
+      checkCurrent();
+      stage = 'inference';
+      emit('testing', null, 'Testing a fixed sample on WebGPU…');
+      inputs = tokenizer(SAMPLE, { padding: true, truncation: true, max_length: 64 });
+      output = await model(inputs);
+      checkCurrent();
+      validateEmbedding(output);
+      discardTensors(inputs, output);
+      inputs = output = null;
+      emit('ready', 1, 'EmbeddingGemma 2 passed its sample test on WebGPU.');
+    } catch (error) {
+      discardTensors(inputs, output);
+      await releaseModel();
+      const message = error instanceof ModelFailure ? error.message
+        : stage === 'runtime' ? 'Could not load Transformers.js. Check access to cdn.jsdelivr.net and your connection, then retry.'
+          : stage === 'inference' ? 'The EmbeddingGemma 2 test failed. Check available GPU memory or restart the browser, then retry.'
+            : 'Could not load EmbeddingGemma 2. Check access to huggingface.co and model download hosts, connection and GPU memory, then retry.';
+      emit(error instanceof ModelFailure ? error.phase : 'error', null, message);
+    }
+  }
+
+  function handleMessage(message) {
+    if (message?.type !== 'load-and-test' || !Number.isSafeInteger(message.id) || message.id < 1) return Promise.resolve();
+    if (active) return active;
+    // Start in a microtask so duplicate activations always share this operation.
+    const current = generation;
+    active = Promise.resolve().then(() => run(message.id, current)).finally(() => { active = null; });
+    return active;
+  }
+
+  async function dispose() {
+    ++generation;
+    await releaseModel();
+  }
+
+  return { handleMessage, dispose };
+}
+
+if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope) {
+  const handler = createModelWorker({ postMessage: message => globalThis.postMessage(message) });
+  globalThis.onmessage = event => { void handler.handleMessage(event.data); };
+}
