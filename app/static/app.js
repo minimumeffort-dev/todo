@@ -22,6 +22,13 @@ let composerIcon = 'task';
 let composerComposing = false;
 let openPicker = null;
 let pickerSequence = 0;
+let modelReady = false;
+let modelRuntime = null;
+// Share the toolbar's runtime. Importing it never activates model downloads.
+import('/static/model-runtime.mjs').then(module => {
+  modelRuntime = module.modelRuntime;
+  modelRuntime.subscribe(snapshot => { modelReady = snapshot.phase === 'ready'; });
+}).catch(() => { /* Optional model setup must not prevent ordinary task entry. */ });
 
 function button(className, label) {
   const element = document.createElement('button');
@@ -41,7 +48,9 @@ async function request(url, options = {}) {
   if (!response.ok) {
     let detail;
     try { detail = (await response.json()).detail; } catch { /* Fall back to status. */ }
-    throw new Error(typeof detail === 'string' ? detail : `Request failed (${response.status}). Please try again.`);
+    const exception = new Error(typeof detail === 'string' ? detail : `Request failed (${response.status}). Please try again.`);
+    exception.status = response.status;
+    throw exception;
   }
   return response.status === 204 ? null : response.json();
 }
@@ -52,6 +61,50 @@ function updateCount() {
   count.textContent = rows.size;
   status.textContent = 'Your list is clear. Add a task to get started.';
   status.hidden = rows.size > 0;
+}
+
+function sameSource(first, second) {
+  return first.title === second.title && first.icon === second.icon;
+}
+function embeddingIsCurrent(state, job) {
+  return rows.get(state.item.id) === state && state.embedding === job
+    && sameSource(state.item, job.snapshot);
+}
+function invalidateEmbedding(state, confirmed) {
+  if (state.embedding && (!confirmed || !sameSource(state.embedding.snapshot, confirmed))) {
+    state.embedding = null;
+    state.renderEmbedding();
+  }
+}
+async function processTask(state, job = state.embedding) {
+  if (!job || !embeddingIsCurrent(state, job) || job.pending) return;
+  job.pending = true;
+  job.error = false;
+  state.renderEmbedding();
+  try {
+    // A persistence retry reuses the successful vector; it never recreates the task.
+    if (!job.result) job.result = await modelRuntime.embedTask(job.snapshot);
+    if (!embeddingIsCurrent(state, job)) return;
+    await request(`/api/todos/${encodeURIComponent(state.item.id)}/embedding`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job.result),
+    });
+    if (embeddingIsCurrent(state, job)) state.embedding = null;
+  } catch (exception) {
+    if (!embeddingIsCurrent(state, job)) return;
+    // A source changed in another tab or a deletion is final for this snapshot.
+    if (exception.status === 404 || exception.status === 409 || exception.name === 'AbortError') {
+      state.embedding = null;
+    } else job.error = true;
+  } finally {
+    job.pending = false;
+    state.renderEmbedding();
+  }
+}
+function embedCreatedTask(state) {
+  if (!modelReady || !modelRuntime) return;
+  state.embedding = { snapshot: { title: state.item.title, icon: state.item.icon },
+    result: null, pending: false, error: false };
+  void processTask(state);
 }
 
 // A small, keyboard-accessible picker shared by rows and the composer.
@@ -171,13 +224,38 @@ function makeRow(item) {
   rowStatus.className = 'row-status';
   rowStatus.setAttribute('role', 'status');
   rowStatus.hidden = true;
+  const embeddingStatus = document.createElement('p');
+  embeddingStatus.className = 'row-status embedding-status';
+  embeddingStatus.setAttribute('role', 'status');
+  embeddingStatus.hidden = true;
+  const embeddingFeedback = document.createElement('div');
+  embeddingFeedback.className = 'row-feedback embedding-feedback';
+  embeddingFeedback.hidden = true;
+  const embeddingMessage = document.createElement('p');
+  embeddingMessage.className = 'error';
+  embeddingMessage.setAttribute('role', 'alert');
+  const embeddingRetry = button('retry embedding-retry', 'Retry');
   editor.setAttribute('aria-describedby', `edit-help ${message.id}`);
   title.setAttribute('aria-describedby', 'edit-help');
   completion.setAttribute('aria-describedby', message.id);
   const state = { row, title, editor, completion, remove, item, draft: { title: item.title, icon: item.icon },
     editing: false, composing: false, pending: false, removingIntent: false,
-    failedAction: 'save', failedCompletion: null };
+    failedAction: 'save', failedCompletion: null, embedding: null };
   rows.set(item.id, state);
+  state.renderEmbedding = () => {
+    const job = state.embedding;
+    const retryFocused = document.activeElement === embeddingRetry;
+    embeddingStatus.textContent = job?.pending ? 'Processing…' : '';
+    embeddingStatus.hidden = !job?.pending;
+    embeddingFeedback.hidden = !job?.error;
+    embeddingMessage.textContent = job?.error ? 'Task saved. Processing failed.' : '';
+    embeddingRetry.disabled = Boolean(job?.pending);
+    embeddingRetry.setAttribute('aria-label', `Retry processing ${state.item.title}`);
+    if (retryFocused && embeddingFeedback.hidden) {
+      (state.editing ? editor : title).focus();
+    }
+  };
+  embeddingRetry.addEventListener('click', () => { void processTask(state); });
   const icon = makeIconControl(iconContainer, item.icon, `Icon for ${item.title}`, value => {
     state.draft.icon = value;
     revision++;
@@ -259,6 +337,7 @@ function makeRow(item) {
       const updated = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
       });
+      invalidateEmbedding(state, updated);
       state.item = updated;
       state.draft = { title: updated.title, icon: updated.icon };
       state.sync();
@@ -283,10 +362,12 @@ function makeRow(item) {
     rowError();
     completion.checked = desired;
     try {
-      state.item = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
+      const updated = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ completed: desired }),
       });
+      invalidateEmbedding(state, updated);
+      state.item = updated;
       // Completion changes the saved item without submitting or discarding drafts.
       labels();
     } catch (exception) {
@@ -312,6 +393,7 @@ function makeRow(item) {
         .map(element => element && rows.get(element.dataset.id))
         .find(candidate => candidate && (!candidate.pending || (candidate.editing && candidate.pending === 'save')));
       const restoreFocus = hadFocus && (row.contains(document.activeElement) || document.activeElement === document.body);
+      invalidateEmbedding(state, null);
       rows.delete(item.id);
       row.remove();
       updateCount();
@@ -366,8 +448,9 @@ function makeRow(item) {
   });
   state.sync();
   feedback.append(message, retry);
+  embeddingFeedback.append(embeddingMessage, embeddingRetry);
   content.append(title, editor);
-  row.append(completionControl, iconContainer, content, remove, rowStatus, feedback);
+  row.append(completionControl, iconContainer, content, remove, rowStatus, feedback, embeddingStatus, embeddingFeedback);
   list.append(row);
 }
 
@@ -386,11 +469,13 @@ async function loadItems() {
       const preserveDraft = state.editing || dirty || state.row.contains(document.activeElement);
       if (state.pending) continue;
       if (!byId.has(id)) {
+        invalidateEmbedding(state, null);
         if (preserveDraft) continue;
         state.icon.close(); state.row.remove(); rows.delete(id);
       }
       else {
         const updated = byId.get(id);
+        invalidateEmbedding(state, updated);
         if (preserveDraft) state.item = { ...state.item, completed: updated.completed };
         else {
           state.item = updated;
@@ -468,6 +553,7 @@ form.addEventListener('submit', async event => {
       body: JSON.stringify({ title, icon: composerIcon }),
     });
     if (!rows.has(item.id)) makeRow(item);
+    embedCreatedTask(rows.get(item.id));
     input.value = '';
     composerIcon = 'task';
     composerPicker.update('task');

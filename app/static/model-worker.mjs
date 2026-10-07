@@ -6,11 +6,23 @@ export const MODEL_ARTIFACT = Object.freeze({
   id: 'onnx-community/embeddinggemma-2-ONNX',
   revision: 'daa72c51243991dfcaf9f9137d2c573d8f7790c0',
   dtype: 'q4',
+  // text_config.embedding_dim in the pinned config.json.
+  dimensions: 768,
 });
+export const TASK_INPUT_VERSION = 1;
 export const TRANSFORMERS_VERSION = '4.3.1';
 export const TRANSFORMERS_URL = `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/transformers.min.js`;
 const SAMPLE = 'A small test sentence for the local to-do model.';
 const SETUP_MESSAGE = 'EmbeddingGemma 2 setup is incomplete: its immutable ONNX revision, tokenizer and WebGPU weights must be verified before loading.';
+const TASK_ICONS = new Set(['task', 'star', 'home', 'work', 'shopping', 'heart']);
+
+export function taskSnapshot(task) {
+  if (typeof task?.title !== 'string' || !task.title.trim() || [...task.title].length > 500
+    || !TASK_ICONS.has(task.icon)) {
+    throw new Error('A saved task title and icon are required for embedding.');
+  }
+  return { title: task.title, icon: task.icon };
+}
 
 class ModelFailure extends Error {
   constructor(phase, message) {
@@ -19,24 +31,26 @@ class ModelFailure extends Error {
   }
 }
 
-function validateEmbedding(output) {
+function validateEmbedding(output, dimensions) {
   const embedding = output?.sentence_embedding;
   if (!embedding || !['float32', 'float64'].includes(embedding.type)
     || embedding.dims?.length !== 2 || embedding.dims[0] !== 1
-    || !Number.isSafeInteger(embedding.dims[1]) || embedding.dims[1] < 1
+    || embedding.dims[1] !== dimensions
     || embedding.data?.length !== embedding.dims[1]) {
     throw new ModelFailure('error', 'EmbeddingGemma 2 returned an invalid sample embedding. Please retry.');
   }
   let norm = 0;
   for (const value of embedding.data) {
-    if (!Number.isFinite(value)) {
+    if (!Number.isFinite(value) || !Number.isFinite(Math.fround(value))) {
       throw new ModelFailure('error', 'EmbeddingGemma 2 returned non-finite sample output. Please retry.');
     }
-    norm += value * value;
+    norm += Math.fround(value) ** 2;
   }
   if (!Number.isFinite(norm) || norm <= 0) {
     throw new ModelFailure('error', 'EmbeddingGemma 2 returned an empty sample embedding. Please retry.');
   }
+  // Copy before releasing the GPU-backed output tensor.
+  return Array.from(embedding.data, value => Math.fround(value));
 }
 
 function discardTensors(...collections) {
@@ -83,10 +97,13 @@ export function createModelWorker({
   let model = null;
   let tokenizer = null;
   let generation = 0;
+  let queue = Promise.resolve();
+  let ready = false;
 
   async function releaseModel() {
     const previous = model;
     model = tokenizer = null;
+    ready = false;
     try { await previous?.dispose(); } catch { /* Parent termination releases the worker context too. */ }
   }
 
@@ -101,10 +118,12 @@ export function createModelWorker({
     let inputs;
     let output;
     try {
+      checkCurrent();
       await releaseModel();
       checkCurrent();
       if (artifact.id !== MODEL_ARTIFACT.id || !/^[a-f0-9]{40}$/.test(artifact.revision ?? '')
-        || !['fp32', 'fp16', 'q8', 'q4', 'q4f16'].includes(artifact.dtype)) {
+        || !['fp32', 'fp16', 'q8', 'q4', 'q4f16'].includes(artifact.dtype)
+        || !Number.isSafeInteger(artifact.dimensions) || artifact.dimensions < 1) {
         throw new ModelFailure('error', SETUP_MESSAGE);
       }
       if (!gpu) throw new ModelFailure('unsupported', 'WebGPU is unavailable in this browser’s model worker. Use a WebGPU-capable browser on HTTPS or localhost.');
@@ -135,7 +154,8 @@ export function createModelWorker({
       emit('loading', null, 'Loading the pinned EmbeddingGemma 2 configuration…');
       const config = await AutoConfig.from_pretrained(artifact.id, options);
       checkCurrent();
-      if (config.model_type !== 'embedding_gemma2' || !config.text_config) {
+      if (config.model_type !== 'embedding_gemma2'
+        || config.text_config?.embedding_dim !== artifact.dimensions) {
         throw new ModelFailure('error', 'The pinned artifact is not a supported EmbeddingGemma 2 model. Model setup must be checked.');
       }
       // The published runtime explicitly supports text-only loading this way.
@@ -170,9 +190,10 @@ export function createModelWorker({
       inputs = tokenizer(SAMPLE, { padding: true, truncation: true, max_length: 64 });
       output = await model(inputs);
       checkCurrent();
-      validateEmbedding(output);
+      validateEmbedding(output, artifact.dimensions);
       discardTensors(inputs, output);
       inputs = output = null;
+      ready = true;
       emit('ready', 1, 'EmbeddingGemma 2 passed its sample test on WebGPU.');
     } catch (error) {
       discardTensors(inputs, output);
@@ -185,12 +206,55 @@ export function createModelWorker({
     }
   }
 
+  async function runEmbedding(message, current) {
+    let inputs;
+    let output;
+    const send = data => {
+      if (current === generation) postMessage({ id: message.id, ...data });
+    };
+    try {
+      if (current !== generation) return;
+      const snapshot = taskSnapshot(message);
+      if (!ready || !model || !tokenizer) throw new Error('Load the model before embedding a task.');
+      // Input format v1 is one text embedding with the saved icon's text key.
+      // Titles are bounded to 500 characters; retain their entire tokenized input.
+      inputs = tokenizer(`Icon: ${snapshot.icon}\nTask: ${snapshot.title}`,
+        { padding: true, truncation: false });
+      output = await model(inputs);
+      if (current !== generation) return;
+      const vector = validateEmbedding(output, artifact.dimensions);
+      send({ type: 'embedding', result: {
+        ...snapshot, vector, model: artifact.id, revision: artifact.revision,
+        input_version: TASK_INPUT_VERSION, dimensions: artifact.dimensions,
+      } });
+    } catch {
+      // A task failure is separate from model loading. Keep the resident model
+      // and allow a retry; crashes/timeouts are handled by the parent runtime.
+      send({ type: 'embedding-error', message: 'Could not embed this task. Please retry.' });
+    } finally {
+      discardTensors(inputs, output);
+    }
+  }
+
+  function enqueue(runOperation) {
+    const pending = queue.then(runOperation);
+    queue = pending.catch(() => {});
+    return pending;
+  }
+
   function handleMessage(message) {
-    if (message?.type !== 'load-and-test' || !Number.isSafeInteger(message.id) || message.id < 1) return Promise.resolve();
+    if (!Number.isSafeInteger(message?.id) || message.id < 1) return Promise.resolve();
+    if (message.type === 'embed-task') {
+      const current = generation;
+      // Capture source fields now so a queued caller cannot change the snapshot.
+      const snapshot = { id: message.id, title: message.title, icon: message.icon };
+      return enqueue(() => runEmbedding(snapshot, current));
+    }
+    if (message.type !== 'load-and-test') return Promise.resolve();
     if (active) return active;
     // Start in a microtask so duplicate activations always share this operation.
     const current = generation;
-    active = Promise.resolve().then(() => run(message.id, current)).finally(() => { active = null; });
+    active = enqueue(() => run(message.id, current)).finally(() => { active = null; });
     return active;
   }
 

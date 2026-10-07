@@ -19,7 +19,15 @@
       <noscript><p>This page needs JavaScript to load, add, edit, complete, reopen, and remove your tasks. Enable JavaScript and reload the page.</p></noscript>
       <div class="list-heading">
         <h2>Tasks <span id="count">0</span></h2>
-        <button id="refresh-button" class="secondary" type="button">Refresh</button>
+        <div class="heading-actions">
+          <div class="model-toolbar" id="model-panel" role="group" aria-label="On-device model">
+            <button id="model-load" class="secondary" type="button">Load and test model</button>
+            <progress id="model-progress" max="1" hidden></progress>
+            <span id="model-status" role="status">Model not loaded.</span>
+            <span id="model-error" class="error" role="alert" hidden></span>
+          </div>
+          <button id="refresh-button" class="secondary" type="button">Refresh</button>
+        </div>
       </div>
       <p id="status" role="status">Loading your tasks…</p>
       <ul id="todo-list" aria-label="Tasks"></ul>
@@ -33,18 +41,6 @@
       </form>
       <p id="error" class="error" role="alert" hidden></p>
       <p id="edit-help">Check a task to mark it done; uncheck to undo. Click a title to edit. Enter saves · Escape cancels.</p>
-    </section>
-    <section class="card model-card" id="model-panel" aria-labelledby="model-heading">
-      <div class="list-heading">
-        <h2 id="model-heading">On-device model</h2>
-      </div>
-      <p id="model-description">Optionally load the on-device embedding model to test browser inference. Nothing is downloaded until you choose to load it.</p>
-      <div class="model-controls">
-        <button id="model-load" class="secondary" type="button">Load and test model</button>
-        <progress id="model-progress" max="1" hidden></progress>
-      </div>
-      <p id="model-status" role="status">Model not loaded.</p>
-      <p id="model-error" class="error" role="alert" hidden></p>
     </section>
     <footer>Stored locally on this computer.</footer>
   </main>
