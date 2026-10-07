@@ -197,8 +197,166 @@ test('subscriptions can unsubscribe, fail or dispose during an update', async ()
   assert.equal(workers[0].terminated, true);
 });
 
+function embeddingResult(snapshot, changes = {}) {
+  return {
+    ...snapshot, vector: [0.5, -0.25, ...Array(MODEL_ARTIFACT.dimensions - 2).fill(0)],
+    model: MODEL_ARTIFACT.id, revision: MODEL_ARTIFACT.revision,
+    input_version: 1, dimensions: MODEL_ARTIFACT.dimensions, ...changes,
+  };
+}
+
+function answerEmbedding(worker, result, id = worker.messages.at(-1).id) {
+  worker.onmessage({ data: { id, type: 'embedding', result } });
+}
+
+test('task embedding requires explicit readiness and rejects invalid saved inputs without activation', async () => {
+  const { runtime, workers } = runtimeFixture();
+  await assert.rejects(runtime.embedTask({ title: 'First task', icon: 'task' }), /Load the model/);
+  assert.equal(workers.length, 0);
+  const loading = runtime.loadAndTest();
+  await assert.rejects(runtime.embedTask({ title: 'During loading', icon: 'task' }), /Load the model/);
+  workers[0].succeed();
+  await loading;
+  for (const task of [null, {}, { title: '', icon: 'task' }, { title: '  ', icon: 'task' },
+    { title: 'x'.repeat(501), icon: 'task' }, { title: 12, icon: 'task' }, { title: 'Valid', icon: 'bad' }]) {
+    await assert.rejects(runtime.embedTask(task), /saved task title and icon/);
+  }
+  assert.equal(workers[0].messages.length, 1);
+  runtime.dispose();
+});
+
+test('first and consecutive task embeddings capture saved values, serialize requests and reuse the loaded worker', async () => {
+  const { runtime, workers, states } = runtimeFixture();
+  const loading = runtime.loadAndTest();
+  workers[0].succeed();
+  await loading;
+  const worker = workers[0];
+  const source = { title: 'Buy groceries', icon: 'shopping' };
+  const original = { ...source };
+  const first = runtime.embedTask(source);
+  source.title = 'Unsaved draft';
+  const secondSource = { title: 'Clean home', icon: 'home' };
+  const second = runtime.embedTask(secondSource);
+  secondSource.icon = 'heart';
+  assert.equal(worker.messages.length, 2, 'Only one embedding can be active');
+  assert.deepEqual(worker.messages[1], { type: 'embed-task', id: 2, ...original });
+  // Late duplicate load messages and unrelated IDs cannot settle a task.
+  worker.emit('ready');
+  answerEmbedding(worker, embeddingResult({ title: 'Unrelated', icon: 'star' }), 999);
+  assert.equal(worker.messages.length, 2);
+  const firstResult = embeddingResult(original);
+  answerEmbedding(worker, firstResult);
+  assert.equal(worker.messages.length, 3);
+  assert.deepEqual(worker.messages[2], { type: 'embed-task', id: 3, title: 'Clean home', icon: 'home' });
+  const returned = await first;
+  assert.deepEqual(returned, firstResult);
+  firstResult.vector[0] = 42;
+  assert.equal(returned.vector[0], 0.5, 'Result owns its vector data');
+  answerEmbedding(worker, embeddingResult({ title: 'Clean home', icon: 'home' }));
+  assert.equal((await second).icon, 'home');
+  await runtime.loadAndTest();
+  assert.equal(workers.length, 1);
+  assert.equal(worker.terminated, false);
+  assert.deepEqual(states.map(state => state.phase), ['idle', 'loading', 'testing', 'ready']);
+  runtime.dispose();
+});
+
+test('individual inference errors reject only their request, drain the queue and permit a retry without reloading', async () => {
+  const { runtime, workers, states } = runtimeFixture();
+  const loading = runtime.loadAndTest();
+  workers[0].succeed();
+  await loading;
+  const source = { title: 'Task for retry', icon: 'work' };
+  const first = runtime.embedTask(source);
+  const second = runtime.embedTask(source);
+  const rejection = assert.rejects(first, /Temporary GPU failure/);
+  workers[0].onmessage({ data: { type: 'embedding-error', id: 2, message: 'Temporary GPU failure' } });
+  await rejection;
+  answerEmbedding(workers[0], embeddingResult(source));
+  await second;
+  const retry = runtime.embedTask(source);
+  answerEmbedding(workers[0], embeddingResult(source));
+  await retry;
+  assert.equal(states.at(-1).phase, 'ready');
+  assert.equal(workers.length, 1);
+  assert.equal(workers[0].messages.filter(message => message.type === 'load-and-test').length, 1);
+  runtime.dispose();
+});
+
+test('runtime rejects invalid output and incompatible metadata independently from model lifecycle', async () => {
+  const { runtime, workers, states } = runtimeFixture();
+  const loading = runtime.loadAndTest();
+  workers[0].succeed();
+  await loading;
+  const source = { title: 'Validate output', icon: 'heart' };
+  for (const changes of [
+    { title: 'Different source' }, { icon: 'shopping' }, { model: 'other' }, { revision: 'main' },
+    { input_version: 2 }, { dimensions: 2 }, { vector: [1, 2] },
+    { vector: Array(768).fill(0) }, { vector: Array(768).fill(NaN) },
+    { vector: Array(768).fill(Infinity) }, { vector: Array(768).fill(1e100) },
+    { vector: Array(768).fill(1e-100) }, { vector: Array(768).fill('0.1') },
+  ]) {
+    const pending = runtime.embedTask(source);
+    const rejection = assert.rejects(pending, /invalid task embedding/);
+    answerEmbedding(workers[0], embeddingResult(source, changes));
+    await rejection;
+    assert.equal(states.at(-1).phase, 'ready');
+  }
+  runtime.dispose();
+});
+
+test('embedding timeouts reject active and queued work, release resources and allow reload then retry', async () => {
+  const { runtime, workers, states } = runtimeFixture({ inactivityTimeoutMs: 10 });
+  const loading = runtime.loadAndTest();
+  workers[0].succeed();
+  await loading;
+  const source = { title: 'Timed out', icon: 'task' };
+  const first = runtime.embedTask(source);
+  const second = runtime.embedTask(source);
+  const assertions = Promise.all([assert.rejects(first, /stopped responding/), assert.rejects(second, /stopped responding/)]);
+  const staleResult = workers[0].onmessage;
+  await delay(30);
+  await assertions;
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers[0].messages.length, 2, 'Queued requests are never sent to a timed out worker');
+  assert.equal(states.at(-1).phase, 'error');
+  const reload = runtime.loadAndTest();
+  workers[1].succeed();
+  await reload;
+  const retry = runtime.embedTask(source);
+  staleResult({ data: { id: 2, type: 'embedding', result: embeddingResult(source) } });
+  answerEmbedding(workers[1], embeddingResult(source));
+  await retry;
+  runtime.dispose();
+});
+
+test('worker crashes, message errors and disposal settle every pending embedding', async () => {
+  for (const kind of ['crash', 'messageerror', 'dispose', 'post-failure']) {
+    const { runtime, workers, states } = runtimeFixture();
+    const loading = runtime.loadAndTest();
+    workers[0].succeed();
+    await loading;
+    const source = { title: 'Interrupted', icon: 'star' };
+    const first = runtime.embedTask(source);
+    const second = runtime.embedTask(source);
+    const expected = kind === 'dispose' ? { name: 'AbortError' } : /model worker/i;
+    const assertions = Promise.all([assert.rejects(first, expected), assert.rejects(second, expected)]);
+    if (kind === 'crash') workers[0].onerror({});
+    if (kind === 'messageerror') workers[0].onmessageerror();
+    if (kind === 'dispose') runtime.dispose();
+    if (kind === 'post-failure') {
+      workers[0].postMessage = () => { throw new Error('Worker closed'); };
+      workers[0].onmessage({ data: { id: 2, type: 'embedding-error', message: 'The model worker failed this task' } });
+    }
+    await assertions;
+    assert.equal(workers[0].terminated, true);
+    assert.equal(states.at(-1).phase, kind === 'dispose' ? 'idle' : 'error');
+    runtime.dispose();
+  }
+});
+
 // Deliberately fictional offline fixtures, never selected by the app.
-const fixtureArtifact = { id: MODEL_ARTIFACT.id, revision: 'a'.repeat(40), dtype: 'fp32' };
+const fixtureArtifact = { id: MODEL_ARTIFACT.id, revision: 'a'.repeat(40), dtype: 'fp32', dimensions: 2 };
 
 function tensor(values = [0.6, 0.8], dims = [1, 2]) {
   return { type: 'float32', dims, data: new Float32Array(values), disposed: false,
@@ -224,16 +382,16 @@ class RejectionEvents extends EventTarget {
 }
 
 function workerFixture({ artifact = fixtureArtifact, output = { sentence_embedding: tensor() }, failure, gpu,
-  loadModel, version = TRANSFORMERS_VERSION } = {}) {
+  loadModel, inference, tokenize, version = TRANSFORMERS_VERSION } = {}) {
   const states = [];
   const calls = [];
   const input = { input_ids: tensor([1, 2]), attention_mask: tensor([1, 1]) };
-  const config = { model_type: 'embedding_gemma2', text_config: {}, vision_config: {}, audio_config: {} };
+  const config = { model_type: 'embedding_gemma2', text_config: { embedding_dim: artifact.dimensions }, vision_config: {}, audio_config: {} };
   const errorEvents = new RejectionEvents();
   const model = async inputs => {
     calls.push(['inference', inputs]);
     if (failure === 'inference') throw new Error('GPU lost');
-    return output;
+    return inference ? await inference(inputs) : output;
   };
   model.disposed = false;
   model.dispose = async () => { model.disposed = true; };
@@ -249,7 +407,7 @@ function workerFixture({ artifact = fixtureArtifact, output = { sentence_embeddi
     AutoTokenizer: { from_pretrained: async (id, options) => {
       calls.push(['tokenizer', id, options]);
       if (failure === 'tokenizer') throw new Error('download blocked');
-      return (text, options) => { calls.push(['tokenize', text, options]); return input; };
+      return (text, options) => { calls.push(['tokenize', text, options]); return tokenize ? tokenize(text, options) : input; };
     } },
     AutoModel: { from_pretrained: async (id, options) => {
       calls.push(['model', id, options]);
@@ -277,6 +435,7 @@ test('production artifact pins the verified EmbeddingGemma 2 revision and browse
   assert.equal(MODEL_ARTIFACT.id, 'onnx-community/embeddinggemma-2-ONNX');
   assert.equal(MODEL_ARTIFACT.revision, 'daa72c51243991dfcaf9f9137d2c573d8f7790c0');
   assert.equal(MODEL_ARTIFACT.dtype, 'q4');
+  assert.equal(MODEL_ARTIFACT.dimensions, 768);
   assert.match(TRANSFORMERS_URL, /@4\.3\.1\/dist\/transformers\.min\.js$/);
 });
 
@@ -436,6 +595,162 @@ test('missing, malformed, zero, NaN or infinite sample output never produces rea
     assert.equal(fixture.input.input_ids.disposed, true);
     assert.ok(Object.values(output).every(tensor => tensor.disposed));
   }
+});
+
+test('configuration and output dimensions must match the pinned embedding dimension', async () => {
+  const config = workerFixture();
+  config.config.text_config.embedding_dim = 3;
+  await config.handler.handleMessage({ type: 'load-and-test', id: 1 });
+  assert.equal(config.states.at(-1).phase, 'error');
+  assert.ok(!config.calls.some(call => call[0] === 'inference'));
+  const wrongOutput = workerFixture({ output: { sentence_embedding: tensor([1, 2, 3], [1, 3]) } });
+  await wrongOutput.handler.handleMessage({ type: 'load-and-test', id: 1 });
+  assert.equal(wrongOutput.states.at(-1).phase, 'error');
+  assert.equal(wrongOutput.output.sentence_embedding.disposed, true);
+});
+
+test('worker embeds the combined saved title and icon, copies output and releases all tensors', async () => {
+  const inputs = [];
+  const outputs = [];
+  const fixture = workerFixture({
+    tokenize: text => {
+      const input = { input_ids: tensor(), attention_mask: tensor() };
+      inputs.push(input);
+      return input;
+    },
+    inference: async () => {
+      const output = { sentence_embedding: tensor(), last_hidden_state: tensor([1, 2]) };
+      outputs.push(output);
+      return output;
+    },
+  });
+  await fixture.handler.handleMessage({ type: 'load-and-test', id: 1 });
+  const source = { title: 'Buy groceries ✓', icon: 'shopping' };
+  await fixture.handler.handleMessage({ type: 'embed-task', id: 2, ...source });
+  const result = fixture.states.at(-1);
+  assert.deepEqual(result, { id: 2, type: 'embedding', result: {
+    ...source, vector: Array.from(new Float32Array([0.6, 0.8])),
+    model: fixtureArtifact.id, revision: fixtureArtifact.revision, input_version: 1, dimensions: 2,
+  } });
+  const tokenization = fixture.calls.filter(call => call[0] === 'tokenize').at(-1);
+  assert.equal(tokenization[1], 'Icon: shopping\nTask: Buy groceries ✓');
+  assert.deepEqual(tokenization[2], { padding: true, truncation: false });
+  assert.ok([...inputs, ...outputs].every(collection => Object.values(collection).every(value => value.disposed)));
+  outputs.at(-1).sentence_embedding.data.fill(0);
+  assert.notDeepEqual(result.result.vector, [0, 0]);
+  assert.equal(fixture.model.disposed, false);
+  assert.equal(fixture.calls.filter(call => call[0] === 'model').length, 1);
+  await fixture.handler.dispose();
+});
+
+test('worker queues direct inference calls and does not let queued source snapshots change', async () => {
+  let release;
+  let inFlight = 0;
+  let maximum = 0;
+  let calls = 0;
+  const inputs = [];
+  const fixture = workerFixture({
+    tokenize: () => { const input = { input_ids: tensor() }; inputs.push(input); return input; },
+    inference: async () => {
+      ++calls;
+      ++inFlight;
+      maximum = Math.max(maximum, inFlight);
+      if (calls === 2) await new Promise(resolve => { release = resolve; });
+      --inFlight;
+      return { sentence_embedding: tensor() };
+    },
+  });
+  await fixture.handler.handleMessage({ type: 'load-and-test', id: 1 });
+  const first = fixture.handler.handleMessage({ type: 'embed-task', id: 2, title: 'First', icon: 'task' });
+  const request = { type: 'embed-task', id: 3, title: 'Second', icon: 'home' };
+  const second = fixture.handler.handleMessage(request);
+  request.title = 'Later draft';
+  await delay(0);
+  assert.equal(calls, 2, 'Sample plus first inference are the only calls before release');
+  release();
+  await Promise.all([first, second]);
+  assert.equal(calls, 3);
+  assert.equal(maximum, 1);
+  assert.deepEqual(fixture.states.filter(state => state.type === 'embedding').map(state => state.id), [2, 3]);
+  assert.equal(fixture.states.at(-1).result.title, 'Second');
+  assert.ok(inputs.every(input => input.input_ids.disposed));
+  assert.equal(fixture.calls.filter(call => call[0] === 'model').length, 1);
+  await fixture.handler.dispose();
+});
+
+test('worker inference errors and malformed task vectors release tensors and retain a retryable resident model', async () => {
+  const inputs = [];
+  const outputs = [];
+  let mode = 'success';
+  const fixture = workerFixture({
+    tokenize: () => { const input = { input_ids: tensor() }; inputs.push(input); return input; },
+    inference: async () => {
+      if (mode === 'throw') throw new Error('Transient inference failure');
+      const values = mode === 'zero' ? [0, 0] : mode === 'nan' ? [NaN, 1] : [0.6, 0.8];
+      const output = { sentence_embedding: tensor(values) };
+      outputs.push(output);
+      return output;
+    },
+  });
+  await fixture.handler.handleMessage({ type: 'load-and-test', id: 1 });
+  for (const failure of ['throw', 'zero', 'nan']) {
+    mode = failure;
+    await fixture.handler.handleMessage({ type: 'embed-task', id: 2, title: 'Retry me', icon: 'work' });
+    assert.equal(fixture.states.at(-1).type, 'embedding-error');
+    assert.ok(!('phase' in fixture.states.at(-1)));
+    assert.equal(fixture.model.disposed, false);
+    mode = 'success';
+    await fixture.handler.handleMessage({ type: 'embed-task', id: 3, title: 'Retry me', icon: 'work' });
+    assert.equal(fixture.states.at(-1).type, 'embedding');
+  }
+  assert.ok(inputs.every(input => input.input_ids.disposed));
+  assert.ok(outputs.every(output => output.sentence_embedding.disposed));
+  assert.equal(fixture.calls.filter(call => call[0] === 'model').length, 1);
+  await fixture.handler.dispose();
+});
+
+test('invalid and unloaded task messages cannot download or infer', async () => {
+  const fixture = workerFixture();
+  await fixture.handler.handleMessage({ type: 'embed-task', id: 1, title: 'No model', icon: 'task' });
+  assert.equal(fixture.states.at(-1).type, 'embedding-error');
+  assert.equal(fixture.calls.length, 0);
+  await fixture.handler.handleMessage({ type: 'load-and-test', id: 2 });
+  const calls = fixture.calls.length;
+  for (const source of [{ title: '', icon: 'task' }, { title: 'Valid', icon: 'missing' }]) {
+    await fixture.handler.handleMessage({ type: 'embed-task', id: 3, ...source });
+    assert.equal(fixture.states.at(-1).type, 'embedding-error');
+  }
+  assert.equal(fixture.calls.length, calls);
+  await fixture.handler.dispose();
+});
+
+test('worker disposal during embedding releases late tensors and suppresses active and queued results', async () => {
+  let release;
+  let call = 0;
+  const outputs = [];
+  const inputs = [];
+  const fixture = workerFixture({
+    tokenize: () => { const input = { input_ids: tensor() }; inputs.push(input); return input; },
+    inference: async () => {
+      if (++call === 2) await new Promise(resolve => { release = resolve; });
+      const output = { sentence_embedding: tensor() };
+      outputs.push(output);
+      return output;
+    },
+  });
+  await fixture.handler.handleMessage({ type: 'load-and-test', id: 1 });
+  const first = fixture.handler.handleMessage({ type: 'embed-task', id: 2, title: 'Cancelled', icon: 'home' });
+  const second = fixture.handler.handleMessage({ type: 'embed-task', id: 3, title: 'Queued', icon: 'home' });
+  await delay(0);
+  await fixture.handler.dispose();
+  const snapshot = [...fixture.states];
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(fixture.states, snapshot);
+  assert.equal(call, 2);
+  assert.equal(fixture.model.disposed, true);
+  assert.ok(inputs.every(input => input.input_ids.disposed));
+  assert.ok(outputs.every(output => output.sentence_embedding.disposed));
 });
 
 test('disposal during loading releases a late model and does not report ready', async () => {

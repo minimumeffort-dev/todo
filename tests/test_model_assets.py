@@ -1,5 +1,6 @@
 """Static distribution checks and opt-in browser integration with real inference."""
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import shutil
@@ -76,7 +77,7 @@ import {createServer} from 'node:http';
 import {createReadStream, existsSync, readFileSync, statSync} from 'node:fs';
 import {mkdir, mkdtemp, rename, rm} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
-import {spawn} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
 const root = process.env.MODEL_PROJECT_ROOT;
 const mode = process.argv[1];
@@ -118,7 +119,7 @@ if (mode === 'download') {
   }
   console.log('Verified browser fixtures prepared.'); process.exit(0);
 }
-if (!cold && mode !== 'flows') for (const file of files) {
+if (!cold && !['flows', 'embedding-flows'].includes(mode)) for (const file of files) {
   assert.equal(createHash('sha256').update(readFileSync(file.path)).digest('hex'), file.hash, file.name);
 }
 const fixtureServer = createServer((request, response) => {
@@ -137,6 +138,7 @@ uvicorn.run('app.main:app', fd=s.fileno(), log_level='warning')`],
 let browser;
 let timeout;
 let releaseRuntime;
+let verifyDatabase;
 try {
   const port = await new Promise((resolve, reject) => {
     server.stdout.on('data', chunk => {const m = String(chunk).match(/PORT:(\d+)/); if (m) resolve(m[1]);});
@@ -158,6 +160,40 @@ try {
   timeout = setTimeout(() => {void browser.close();}, cold ? 270000 : 26000);
   const context = await browser.newContext({ignoreHTTPSErrors: cold});
   context.setDefaultTimeout(5000);
+  if (mode === 'embedding-flows') {
+    // UI/API fault checks use an injected runtime. The separate embeddings mode
+    // runs the authentic pinned worker and weights, without replacing inference.
+    await context.route('**/static/model-runtime.mjs', route => route.fulfill({
+      contentType: 'text/javascript', body: `
+const artifact = ${JSON.stringify(MODEL_ARTIFACT)};
+const controls = window.__embeddingFixture = {calls: [], pending: [], hold: false, failNext: 0};
+const listeners = new Set();
+let state = {phase: 'idle', progress: null, message: ''};
+function publish(phase) {
+  state = {phase, progress: phase === 'ready' ? 1 : null,
+    message: phase === 'ready' ? 'EmbeddingGemma 2 passed its sample test on WebGPU.' : ''};
+  for (const listener of listeners) listener(state);
+}
+controls.release = title => {
+  const pending = controls.pending.filter(item => !title || item.source.title === title);
+  controls.pending = controls.pending.filter(item => !pending.includes(item));
+  for (const item of pending) item.resolve(item.result);
+};
+export const modelRuntime = {
+  subscribe(listener) {listeners.add(listener); listener(state); return () => listeners.delete(listener);},
+  async loadAndTest() {publish('ready');},
+  dispose() {publish('idle');},
+  embedTask(source) {
+    source = {...source}; controls.calls.push(source);
+    if (controls.failNext-- > 0) return Promise.reject(Error('Injected inference failure'));
+    const vector = Array(artifact.dimensions).fill(0); vector[0] = 0.5; vector[1] = -0.25;
+    const result = {...source, vector, model: artifact.id, revision: artifact.revision,
+      input_version: 1, dimensions: artifact.dimensions};
+    return controls.hold ? new Promise(resolve => controls.pending.push({source, result, resolve}))
+      : Promise.resolve(result);
+  },
+};` }));
+  }
   await context.addInitScript(() => {
     window.__modelMessages = []; window.__modelPhases = []; window.__testingClicks = 0;
     const NativeWorker = window.Worker;
@@ -179,7 +215,19 @@ try {
     };
   });
   const external = [];
+  const creations = [];
+  const uploads = [];
+  const uploadResponses = [];
   context.on('request', request => {if (request.url().startsWith('https://')) external.push(request.url());});
+  context.on('request', request => {
+    if (request.method() === 'POST' && request.url().endsWith('/api/todos')) creations.push(request.postDataJSON());
+    if (request.method() === 'PUT' && request.url().endsWith('/embedding')) {
+      uploads.push({id: new URL(request.url()).pathname.split('/')[3], ...request.postDataJSON()});
+    }
+  });
+  context.on('response', response => {
+    if (response.request().method() === 'PUT' && response.url().endsWith('/embedding')) uploadResponses.push(response.status());
+  });
   let blockRuntime = mode === 'errors' || mode === 'flows';
   let blockedModelFile = mode === 'external-error' ? 'model_q4.onnx_data' : '';
   const gate = new Promise(resolve => {releaseRuntime = resolve;});
@@ -227,11 +275,17 @@ env.fetch = (url, options) => {
       }));
     }, {files: files.map(({name, url}) => ({name, url})), fixtureOrigin, exclude});
   }
-  async function add(title) {
+  async function add(title, icon = 'task') {
     if (await page.locator('#todo-form').isHidden()) await page.locator('#new-task').click();
+    const before = await page.locator('.task-row').count();
+    if (icon !== 'task') {
+      await page.locator('#composer-icon .icon-button').click();
+      await page.locator('#composer-icon').getByRole('button', {name: icon[0].toUpperCase() + icon.slice(1), exact: true}).click();
+    }
     await page.locator('#todo-title').fill(title);
     await page.locator('#todo-title').press('Enter');
-    const titleButton = page.getByRole('button', {name: `Edit ${title}`, exact: true});
+    await expect(page.locator('.task-row')).toHaveCount(before + 1);
+    const titleButton = page.getByRole('button', {name: `Edit ${title.trim()}`, exact: true}).last();
     await expect(titleButton).toBeVisible();
     const id = await titleButton.locator('xpath=ancestor::li').getAttribute('data-id');
     return page.locator(`li[data-id="${id}"]`);
@@ -283,6 +337,155 @@ env.fetch = (url, options) => {
     assert.deepEqual((await saved()).map(({title, completed}) => ({title, completed})), [{title: 'Task added while model loads', completed: true}]);
     assert.ok(!external.some(url => /vision_encoder|audio_encoder/.test(url)));
     if (!cold) assert.ok(external.every(url => files.some(file => file.url === url && /\.m?js$/.test(file.name))));
+    assert.equal(uploads.length, 0, 'Loading the model must not retroactively embed existing tasks');
+  } else if (mode === 'embeddings') {
+    await seed();
+    await page.locator('#model-load').click(); await ready();
+    assert.equal((await saved()).length, 0);
+    const first = await add('  Buy groceries  ', 'shopping');
+    await expect.poll(() => uploadResponses.filter(status => status === 204).length).toBe(1);
+    const second = await add('Buy groceries', 'heart');
+    const third = await add('Read a book', 'shopping');
+    await page.locator('#todo-title').fill('Next task draft');
+    await expect.poll(() => uploadResponses.filter(status => status === 204).length).toBe(3);
+    for (const row of [first, second, third]) {
+      await expect(row.locator('.embedding-status')).toBeHidden();
+      await expect(row.locator('.embedding-feedback')).toBeHidden();
+      await expect(row.locator('.task-completion')).toBeEnabled();
+    }
+    await expect(page.locator('#todo-title')).toHaveValue('Next task draft');
+    await expect(page.locator('#todo-title')).toBeFocused();
+    const sources = uploads.map(({title, icon}) => ({title, icon}));
+    assert.deepEqual(sources, [{title: 'Buy groceries', icon: 'shopping'},
+      {title: 'Buy groceries', icon: 'heart'}, {title: 'Read a book', icon: 'shopping'}]);
+    for (const item of uploads) {
+      assert.equal(item.vector.length, MODEL_ARTIFACT.dimensions);
+      assert.ok(item.vector.every(Number.isFinite)); assert.ok(item.vector.some(value => value !== 0));
+      assert.equal(item.model, MODEL_ARTIFACT.id); assert.equal(item.revision, MODEL_ARTIFACT.revision);
+      assert.equal(item.input_version, 1); assert.equal(item.dimensions, 768);
+    }
+    const difference = (first, second) => Math.max(...first.map((value, index) => Math.abs(value - second[index])));
+    assert.ok(difference(uploads[0].vector, uploads[1].vector) > 1e-5, 'The icon must affect the vector');
+    assert.ok(difference(uploads[0].vector, uploads[2].vector) > 1e-5, 'The title must affect the vector');
+    const messages = await page.evaluate(() => window.__modelMessages);
+    assert.equal(messages.filter(message => message.type === 'load-and-test').length, 1);
+    assert.equal(messages.filter(message => message.type === 'embed-task').length, 3);
+    assert.equal(creations.length, 3);
+    for (const task of await saved()) assert.deepEqual(Object.keys(task).sort(), ['completed', 'icon', 'id', 'title']);
+    await page.setViewportSize({width: 375, height: 700});
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
+    verifyDatabase = data => {
+      assert.equal(data.length, 3);
+      for (const task of data) {
+        const expected = uploads.find(item => item.id === task.id);
+        assert.ok(expected);
+        assert.equal(task.title, expected.title); assert.equal(task.icon, expected.icon);
+        assert.deepEqual(task.vector, expected.vector);
+        assert.equal(task.model, expected.model); assert.equal(task.revision, expected.revision);
+        assert.equal(task.input_version, 1); assert.equal(task.dimensions, 768);
+      }
+    };
+  } else if (mode === 'embedding-flows') {
+    const unloaded = await add('No model needed');
+    assert.equal(uploads.length, 0);
+    assert.equal(await page.evaluate(() => window.__embeddingFixture.calls.length), 0);
+    await page.locator('#model-load').click(); await ready();
+    await page.evaluate(() => {window.__embeddingFixture.hold = true;});
+    const first = await add('First queued task', 'shopping');
+    const second = await add('Second queued task', 'heart');
+    assert.equal(await page.evaluate(() => window.__embeddingFixture.calls.length), 2);
+    await expect(first.locator('.embedding-status')).toBeVisible();
+    await expect(second.locator('.embedding-status')).toBeVisible();
+    await expect(page.locator('#add-button')).toBeEnabled();
+    await first.locator('.task-title').click(); await first.locator('.task-editor').fill('Unsaved during processing');
+    await first.locator('.task-completion').check(); await expect(first.locator('.task-completion')).toBeEnabled();
+    await first.locator('.task-editor').focus();
+    await page.evaluate(() => {document.querySelector('#todo-title').value = 'Next composer draft'; window.__embeddingFixture.release();});
+    await expect.poll(() => uploadResponses.filter(status => status === 204).length).toBe(2);
+    await expect(first.locator('.task-editor')).toHaveValue('Unsaved during processing');
+    await expect(first.locator('.task-editor')).toBeFocused();
+    await expect(page.locator('#todo-title')).toHaveValue('Next composer draft');
+    await expect(first.locator('.task-completion')).toBeChecked();
+    await first.locator('.task-editor').press('Escape');
+    await page.evaluate(() => {window.__embeddingFixture.hold = false; window.__embeddingFixture.failNext = 1;});
+    const inferenceFailure = await add('Inference retry');
+    await expect(inferenceFailure.locator('.embedding-feedback')).toBeVisible();
+    await expect(page.locator('#error')).toBeHidden(); await expect(page.locator('#model-error')).toBeHidden();
+    const failedId = await inferenceFailure.getAttribute('data-id');
+    await page.route(`**/api/todos/${failedId}`, route => route.request().method() === 'PUT'
+      ? route.fulfill({status: 503, contentType: 'application/json', body: '{"detail":"Save temporarily failed"}'}) : route.continue());
+    await inferenceFailure.locator('.task-title').click(); await inferenceFailure.locator('.task-editor').fill('Kept failed-save draft');
+    await inferenceFailure.locator('.task-editor').press('Enter');
+    const saveFeedback = inferenceFailure.locator('.row-feedback:not(.embedding-feedback)');
+    await expect(saveFeedback).toBeVisible();
+    const createdBeforeRetry = creations.length;
+    await inferenceFailure.locator('.embedding-retry').click();
+    await expect(inferenceFailure.locator('.embedding-feedback')).toBeHidden();
+    await expect(inferenceFailure.locator('.embedding-status')).toBeHidden();
+    await expect(saveFeedback).toBeVisible();
+    await expect(inferenceFailure.locator('.task-editor')).toHaveValue('Kept failed-save draft');
+    assert.equal(creations.length, createdBeforeRetry, 'Inference retry must not POST another task');
+    assert.equal(await page.evaluate(() => window.__embeddingFixture.calls.filter(item => item.title === 'Inference retry').length), 2);
+    await inferenceFailure.locator('.task-editor').press('Escape');
+    let failUpload = true;
+    await page.route('**/api/todos/*/embedding', route => {
+      if (failUpload && route.request().postDataJSON().title === 'Upload retry') {
+        failUpload = false;
+        return route.fulfill({status: 503, contentType: 'application/json', body: '{"detail":"Upload temporarily failed"}'});
+      }
+      return route.continue();
+    });
+    const uploadFailure = await add('Upload retry');
+    await expect(uploadFailure.locator('.embedding-feedback')).toBeVisible();
+    const inferredBeforeRetry = await page.evaluate(() => window.__embeddingFixture.calls.length);
+    const postedBeforeRetry = creations.length;
+    await uploadFailure.locator('.embedding-retry').focus(); await page.keyboard.press('Enter');
+    await expect(uploadFailure.locator('.embedding-feedback')).toBeHidden();
+    await expect(uploadFailure.locator('.embedding-status')).toBeHidden();
+    assert.equal(creations.length, postedBeforeRetry);
+    assert.equal(await page.evaluate(() => window.__embeddingFixture.calls.length), inferredBeforeRetry, 'Upload retry reuses its vector');
+    const attempts = uploads.filter(item => item.title === 'Upload retry');
+    assert.equal(attempts.length, 2); assert.deepEqual(attempts[0], attempts[1]);
+    await page.evaluate(() => {window.__embeddingFixture.hold = true;});
+    const edited = await add('Edit before inference');
+    await edited.locator('.task-title').click(); await edited.locator('.task-editor').fill('Changed source');
+    await edited.locator('.task-editor').press('Enter'); await expect(edited.locator('.task-title')).toHaveText('Changed source');
+    const removed = await add('Delete before inference');
+    await removed.locator('.remove').click(); await expect(removed).toHaveCount(0);
+    const uploadsBeforeStale = uploads.length;
+    await page.evaluate(() => {window.__embeddingFixture.release(); window.__embeddingFixture.hold = false;});
+    await expect(edited.locator('.embedding-status')).toBeHidden();
+    await expect(edited.locator('.embedding-feedback')).toBeHidden();
+    assert.equal(uploads.length, uploadsBeforeStale, 'Changed/deleted task results must be discarded');
+    for (const status of [409, 404]) {
+      await page.route('**/api/todos/*/embedding', async route => {
+        const body = route.request().postDataJSON();
+        if (body.title !== `Remote race ${status}`) return route.fallback();
+        const url = route.request().url().replace(/\/embedding$/, '');
+        const response = await context.request.fetch(url, status === 409
+          ? {method: 'PUT', data: {title: 'Changed in another tab', icon: 'star'}} : {method: 'DELETE'});
+        assert.ok(response.ok()); await route.continue();
+      });
+      const raced = await add(`Remote race ${status}`);
+      await expect.poll(() => uploadResponses.includes(status)).toBe(true);
+      await expect(raced.locator('.embedding-status')).toBeHidden();
+      await expect(raced.locator('.embedding-feedback')).toBeHidden();
+      await page.locator('#refresh-button').click(); await expect(page.locator('#refresh-button')).toBeEnabled();
+    }
+    await expect(unloaded.locator('.embedding-feedback')).toBeHidden();
+    assert.equal(await page.evaluate(() => window.__embeddingFixture.calls.some(item => item.title === 'No model needed')), false);
+    await page.setViewportSize({width: 375, height: 700});
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
+    assert.deepEqual(external, [], 'Injected UI checks must stay offline');
+    verifyDatabase = data => {
+      assert.equal(data.find(item => item.title === 'No model needed').vector, null);
+      assert.equal(data.find(item => item.title === 'Changed source').vector, null);
+      assert.ok(!data.some(item => item.title === 'Delete before inference' || item.title === 'Remote race 404'));
+      assert.equal(data.find(item => item.title === 'Changed in another tab').vector, null);
+      for (const title of ['First queued task', 'Second queued task', 'Inference retry', 'Upload retry']) {
+        assert.equal(data.find(item => item.title === title).vector.length, 768);
+      }
+    };
   } else if (mode === 'errors') {
     await seed('model_q4.onnx_data');
     await page.locator('#model-load').click();
@@ -344,9 +547,9 @@ env.fetch = (url, options) => {
       if (failPatch && route.request().method() === 'PATCH') {failPatch = false; await route.fulfill({status: 503, contentType: 'application/json', body: '{"detail":"Completion temporarily failed"}'});}
       else await route.continue();
     });
-    await checkbox.check(); await expect(row.locator('.row-feedback')).toBeVisible();
+    await checkbox.check(); await expect(row.locator('.row-feedback:not(.embedding-feedback)')).toBeVisible();
     await expect(checkbox).not.toBeChecked(); await expect(row.locator('.task-editor')).toHaveValue('Preserved draft');
-    await row.locator('.retry').click(); await expect(checkbox).toBeChecked(); await expect(checkbox).toBeEnabled();
+    await row.locator('.row-feedback:not(.embedding-feedback) .retry').click(); await expect(checkbox).toBeChecked(); await expect(checkbox).toBeEnabled();
     await expect(row.locator('.task-editor')).toHaveValue('Preserved draft');
     await row.locator('.remove').click(); await expect(row).toHaveCount(0);
     await expect(other).toBeVisible(); assert.equal((await saved()).length, 1);
@@ -362,7 +565,22 @@ env.fetch = (url, options) => {
   fixtureServer.closeAllConnections(); await new Promise(resolve => fixtureServer.close(resolve));
   const stopped = new Promise(resolve => {if (server.exitCode !== null) resolve(); else server.once('exit', resolve);});
   server.kill('SIGTERM'); await stopped;
-  await rm(directory, {recursive: true, force: true});
+  try {
+    if (verifyDatabase) {
+      // DuckDB permits one writer process. Inspect only after stopping FastAPI,
+      // then reopen the app to verify that persisted vectors survive startup.
+      const result = spawnSync(process.env.MODEL_TEST_PYTHON, ['-c', `import json, sys, duckdb
+from fastapi.testclient import TestClient
+from app.main import create_app
+with TestClient(create_app(sys.argv[1])) as client:
+    assert client.get('/api/todos').status_code == 200
+with duckdb.connect(sys.argv[1]) as db:
+    rows = db.execute('SELECT id, title, icon, embedding, embedding_model, embedding_revision, embedding_input_version, embedding_dimensions FROM todos ORDER BY created_at, id').fetchall()
+print(json.dumps([dict(zip(('id', 'title', 'icon', 'vector', 'model', 'revision', 'input_version', 'dimensions'), row)) for row in rows]))`, `${directory}/todos.duckdb`], {cwd: root, encoding: 'utf8'});
+      assert.equal(result.status, 0, result.stderr);
+      verifyDatabase(JSON.parse(result.stdout));
+    }
+  } finally {await rm(directory, {recursive: true, force: true});}
 }
 """
 
@@ -401,10 +619,32 @@ def test_task_flows_and_drafts_with_model_panel():
     run_browser("flows")
 
 
+@browser_check
+def test_real_task_embeddings_include_first_title_and_icon():
+    run_browser("embeddings")
+
+
+@browser_check
+def test_embedding_creation_retries_and_races():
+    run_browser("embedding-flows")
+
+
 if __name__ == "__main__":
-    if sys.argv[1:] != ["--download-fixtures"]:
-        raise SystemExit("Usage: python tests/test_model_assets.py --download-fixtures")
-    subprocess.run(
-        [node_executable(), "--input-type=module", "-e", BROWSER_CHECK, "download"],
-        cwd=ROOT, env={**os.environ, "MODEL_PROJECT_ROOT": str(ROOT)}, check=True, timeout=600,
-    )
+    if sys.argv[1:] == ["--download-fixtures"]:
+        subprocess.run(
+            [node_executable(), "--input-type=module", "-e", BROWSER_CHECK, "download"],
+            cwd=ROOT, env={**os.environ, "MODEL_PROJECT_ROOT": str(ROOT)}, check=True, timeout=600,
+        )
+    elif sys.argv[1:] == ["--check-regressions"]:
+        # Only one of these jobs runs real inference. Keep it free of another
+        # software-GPU load while fitting the independently rerun 30-second check.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            jobs = [pool.submit(subprocess.run,
+                [sys.executable, "-m", "pytest", str(ROOT / "tests"), "-q", "-p", "no:cacheprovider"],
+                cwd=ROOT, env={**os.environ, "MODEL_BROWSER_CHECK": "0"}, check=True, timeout=28),
+                pool.submit(run_browser, "errors"), pool.submit(run_browser, "flows")]
+            for job in jobs:
+                job.result()
+        print("Python, Node, task-flow, cached-loading and responsive-control checks passed.")
+    else:
+        raise SystemExit("Usage: python tests/test_model_assets.py --download-fixtures | --check-regressions")

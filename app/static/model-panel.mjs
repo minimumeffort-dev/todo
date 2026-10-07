@@ -1,11 +1,14 @@
-// Model panel wiring for the on-device embedding-model test.
+// Compact model-toolbar wiring for the on-device embedding model.
 //
-// The panel subscribes to modelRuntime snapshots of the shape
-// { phase, progress, message } where phase is one of
-// "idle", "loading", "testing", "ready", "unsupported" or "error",
-// and progress is null (indeterminate) or a 0..1 fraction.
-// All model feedback stays inside #model-panel; task controls and the
-// task status/error elements (#status, #error) are never touched.
+// The toolbar lives inside the task card heading and subscribes to
+// modelRuntime snapshots of the shape { phase, progress, message } where
+// phase is one of "idle", "loading", "testing", "ready", "unsupported" or
+// "error", and progress is null (indeterminate) or a 0..1 fraction.
+// Individual embedding operations report through their own promises and
+// never publish loading snapshots, so this toolbar only reflects the
+// shared model lifecycle. All model feedback stays inside #model-panel;
+// task controls and the task status/error elements (#status, #error)
+// are never touched.
 
 export const MODEL_LOAD_LABEL = 'Load and test model';
 

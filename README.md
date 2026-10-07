@@ -61,17 +61,36 @@ Stop the server with Ctrl+C.
 
 ## Run EmbeddingGemma 2
 
-Choose **Load and test model** in the **On-device model** panel. This loads the
+Choose **Load and test model** beside **Refresh** in the task toolbar. This loads the
 model on demand in a module worker and runs a built-in sample sentence on
 WebGPU. **Model ready** means inference succeeded with finite, nonzero output.
-The sample output is validated and discarded. Task titles and drafts are never
-sent to the model. Uploads, task embeddings, vector storage, and search are
-reserved for future work.
+The sample output is validated and discarded. Loading remains optional.
+
+When the model is ready, each newly saved task—including the first task—gets
+one embedding from its confirmed title and icon. Processing runs in the
+background; the composer stays ready for another task. A small **Processing…**
+status appears on the task until its vector is saved. Tasks added before the
+model is ready stay saved without an embedding; loading does not process old tasks.
+
+If inference or saving its vector fails, the task stays saved and gets a separate
+**Retry** for processing. This never adds the task again. A failed vector upload
+reuses its computed vector; an inference retry runs the model again. Task-save
+errors and their retries remain separate. After a worker crash or timeout, load
+the model again using the toolbar's **Retry**, then retry processing on the task.
+Results for changed or deleted tasks are discarded. Completion changes preserve
+embeddings; changing a saved title or icon clears them. Edits do not automatically
+start another embedding.
+
+Inference stays in the browser. Only saved task values go to the model worker;
+unsaved drafts are not used. The combined text is exactly
+`Icon: <icon>\nTask: <title>` (input version 1), using the icon's text key, such as
+`shopping`. The resulting 768-value vector and its source metadata go only to
+the local FastAPI app. There are no task hints, generated text, or search yet.
 
 The model panel shows indeterminate progress during setup and a percentage
 when the download total is available. **Retry** starts a fresh worker after a
-loading or inference failure. Tasks remain usable during model loading, testing,
-and errors.
+loading failure or worker timeout. Tasks remain usable during model loading,
+testing, and errors.
 
 Use a current WebGPU-capable browser with WebGPU available in module workers,
 hardware acceleration, and enough GPU memory. Serve the app on **HTTPS or
@@ -88,7 +107,7 @@ The verified pins are:
 | Transformers.js | `4.3.1` |
 | ONNX Runtime Web dependency | `1.31.0-dev.20260914-8d85527a0` |
 
-This fixed text test loads the text encoder and tokenizer. Vision and audio
+The model loads the text encoder and tokenizer. Vision and audio
 encoder configs are disabled. All model and tokenizer requests, including
 metadata probes, use the pinned revision.
 
@@ -112,6 +131,10 @@ against a database file.
 New tasks start incomplete. Startup upgrades older databases automatically:
 missing icons default to Task, and existing tasks start incomplete when the
 completion field is added. Existing titles, IDs, icons, and ordering are preserved.
+Startup also adds nullable embedding columns without changing saved tasks.
+DuckDB stores vectors directly as `FLOAT[]`, alongside the pinned model ID,
+immutable revision, input-format version, and dimension count. No separate vector
+database is needed. Vectors survive application restarts.
 
 To choose a different database location, set `TODO_DB_PATH` before starting:
 
@@ -123,14 +146,16 @@ TODO_DB_PATH=/absolute/path/to/todos.duckdb .venv/bin/python -m uvicorn app.main
 
 ```sh
 .venv/bin/python -m pip install 'setuptools>=68' wheel
-.venv/bin/python -m pytest tests/test_todos.py tests/test_health.py tests/test_model_assets.py -q
+.venv/bin/python -m pytest -q -p no:cacheprovider
 mise exec node@22.20.0 -- node --test tests/model_runtime.test.mjs
 ```
 
 The API tests use temporary databases and cover adding, listing, editing,
 deleting, completing and reopening, invalid input, supported icons, missing
 items, legacy database upgrades, repeated completion requests, persistence
-across application restarts, and health checks without database access.
+across application restarts, embedding migration and persistence, vector and
+metadata validation, stale uploads, edit invalidation, completion preservation,
+and health checks without database access.
 Model asset checks also verify JavaScript serving, the panel's separate status
 elements, wheel packaging, and the offline worker lifecycle suite. These checks
 need Node 22. Install it with `mise install node@22.20.0` if needed. Browser
@@ -158,6 +183,9 @@ MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests
 MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k failures_retry -q
 MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k external_weight -q
 MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k task_flows -q
+MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k real_task_embeddings -q
+MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k embedding_creation -q
+.venv/bin/python tests/test_model_assets.py --check-regressions
 ```
 
 The first two run the actual model in the production worker with authentic
@@ -171,6 +199,15 @@ The third specifically checks that a failed external-weight download offers
 **Retry**, then verifies real inference succeeds after retry. The fourth checks
 task add/edit/complete/reopen/remove flows, completion failure/retry, and a
 narrow layout alongside the model panel.
+The fifth creates the first and consecutive tasks with the real model, verifies
+that both title and icon affect their vectors, and inspects DuckDB after a restart.
+The sixth uses an injected runtime with the real API for deterministic inference
+and upload failures, separate retries, completion during processing, and local
+and remote edit/delete races. It also checks that background processing keeps
+drafts and keyboard focus intact.
+The final command runs the Python and offline Node suites alongside the cached
+loading/retry and task-flow browser checks. It runs only one real-model scenario
+at a time to limit CPU contention on the software WebGPU adapter.
 
 For a cold download check, set `MODEL_COLD_DOWNLOAD=1` on the `real_model` command;
 this uses the actual CDN requests and can take several minutes. In the managed
@@ -204,3 +241,12 @@ Icon values are `task` (the default when adding), `star`, `home`, `work`,
 `shopping`, and `heart`. Titles are trimmed and must contain 1–500 characters.
 Interactive API documentation is at
 <http://127.0.0.1:8000/docs> while the app runs.
+
+`PUT /api/todos/{id}/embedding` accepts
+`{title, icon, vector, model, revision, input_version, dimensions}`. Use the pinned
+model and revision above, input version `1`, and exactly `768` finite
+float32-compatible values forming a nonzero vector. Success returns 204;
+incompatible metadata or an invalid vector returns 422, a missing task returns
+404, and a changed title/icon snapshot returns 409. Source comparison and the
+vector write are atomic.
+Ordinary task responses still contain only `id`, `title`, `icon`, and `completed`.

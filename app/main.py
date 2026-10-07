@@ -1,18 +1,28 @@
 """Run locally with: uvicorn app.main:app --host 127.0.0.1 --port 8000."""
 
 from contextlib import asynccontextmanager
+import math
 import os
 from pathlib import Path
-from typing import Literal
+import struct
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
 from app.db import DEFAULT_ICON, TodoStore
 
 TodoIcon = Literal["task", "star", "home", "work", "shopping", "heart"]
+# Verified from text_config.embedding_dim in this immutable model configuration.
+EMBEDDING_MODEL = "onnx-community/embeddinggemma-2-ONNX"
+EMBEDDING_REVISION = "daa72c51243991dfcaf9f9137d2c573d8f7790c0"
+EMBEDDING_DIMENSIONS = 768
+EMBEDDING_INPUT_VERSION = 1
+Float32Value = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 
 
 class TodoInput(BaseModel):
@@ -31,6 +41,34 @@ class TodoUpdate(TodoInput):
 
 class TodoCompletion(BaseModel):
     completed: StrictBool
+
+
+class TaskEmbedding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Do not trim a source snapshot: it must match the confirmed saved values.
+    title: str = Field(strict=True, min_length=1, max_length=500)
+    icon: TodoIcon
+    vector: list[Float32Value] = Field(
+        min_length=EMBEDDING_DIMENSIONS, max_length=EMBEDDING_DIMENSIONS
+    )
+    model: Literal[EMBEDDING_MODEL]
+    revision: Literal[EMBEDDING_REVISION]
+    input_version: StrictInt = Field(ge=EMBEDDING_INPUT_VERSION, le=EMBEDDING_INPUT_VERSION)
+    dimensions: StrictInt = Field(ge=EMBEDDING_DIMENSIONS, le=EMBEDDING_DIMENSIONS)
+
+    @field_validator("vector")
+    @classmethod
+    def validate_vector(cls, values):
+        # DuckDB FLOAT[] stores float32. Reject overflow and vectors that become
+        # entirely zero after conversion, rather than accepting unusable data.
+        try:
+            converted = [struct.unpack("f", struct.pack("f", value))[0] for value in values]
+        except (OverflowError, struct.error) as error:
+            raise ValueError("Embedding values must fit float32") from error
+        if not all(math.isfinite(value) for value in converted) or not any(converted):
+            raise ValueError("Embedding must have finite, nonzero float32 output")
+        return converted
 
 
 class Todo(BaseModel):
@@ -80,6 +118,28 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         if updated is None:
             raise HTTPException(status_code=404, detail="To-do item not found")
         return updated
+
+    @application.put("/api/todos/{item_id}/embedding", status_code=204)
+    def save_todo_embedding(item_id: str, item: TaskEmbedding):
+        result = store.set_embedding(item_id, **item.model_dump())
+        if result == "missing":
+            raise HTTPException(status_code=404, detail="To-do item not found")
+        if result == "stale":
+            raise HTTPException(status_code=409, detail="To-do title or icon changed")
+        return Response(status_code=204)
+
+    @application.exception_handler(RequestValidationError)
+    async def invalid_input(request: Request, error: RequestValidationError):
+        if request.scope.get("endpoint") is save_todo_embedding:
+            # Non-finite inputs can be parsed from JSON, but cannot be echoed in
+            # JSON error responses. Return useful field errors without the vector
+            # or non-serializable validator context, including for NaN/Infinity.
+            detail = [
+                {key: issue[key] for key in ("loc", "msg", "type")}
+                for issue in error.errors()
+            ]
+            return JSONResponse(status_code=422, content={"detail": detail})
+        return await request_validation_exception_handler(request, error)
 
     @application.delete("/api/todos/{item_id}", status_code=204)
     def delete_todo(item_id: str):
