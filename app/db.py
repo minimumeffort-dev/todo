@@ -10,6 +10,11 @@ from uuid import uuid4
 import duckdb
 
 DEFAULT_ICON = "task"
+# Heuristic calibrated with the pinned q4 model and task input format v1:
+# "purchase food" / "read a story" score relevant tasks at 0.739 / 0.759;
+# unrelated tasks and "repair the spacecraft engine" score 0.598-0.639
+# (tests/test_model_assets.py). Keep a gap; cosine scores are not probabilities.
+MIN_SEARCH_COSINE_SIMILARITY = 0.70
 EMBEDDING_COLUMNS = (
     "embedding", "embedding_model", "embedding_revision",
     "embedding_input_version", "embedding_dimensions",
@@ -123,10 +128,15 @@ class TodoStore:
             stored = row[4]
             norm = math.sqrt(math.fsum(value * value for value in stored))
             score = math.fsum(a * b for a, b in zip(vector, stored)) / (query_norm * norm)
-            matches.append({"todo": self._todo(row), "score": max(-1.0, min(1.0, score))})
+            score = max(-1.0, min(1.0, score))
+            if score >= MIN_SEARCH_COSINE_SIMILARITY:
+                matches.append({"todo": self._todo(row), "score": score})
         # Python's stable sort retains created_at/id order for equal scores.
         matches.sort(key=lambda match: match["score"], reverse=True)
-        return {"matches": matches[:limit], "pending_count": pending_count}
+        return {
+            "matches": matches[:limit], "pending_count": pending_count,
+            "min_score": MIN_SEARCH_COSINE_SIMILARITY,
+        }
 
     def update(self, item_id: str, title: str, icon: str) -> dict[str, str | bool] | None:
         # Compare against the old source in the same UPDATE. No-op saves and

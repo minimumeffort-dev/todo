@@ -9,19 +9,21 @@
   <script type="module" src="/static/model-panel.mjs"></script>
 </head>
 <body>
-  <main>
-    <header>
-      <p class="eyebrow">YOUR SPACE</p>
-      <h1>Your to-do list</h1>
-      <p>A little room for what matters.</p>
-    </header>
-    <div id="model-panel" class="model-indicator" role="group" aria-label="On-device model">
+  <div id="model-panel" class="model-indicator model-statusbar" role="group" aria-label="On-device model">
+    <div class="model-statusbar-inner">
       <span class="model-dot" aria-hidden="true"></span>
       <span id="model-status" role="status">Loading model…</span>
       <progress id="model-progress" max="1" hidden></progress>
       <span id="model-error" class="error" role="alert" hidden></span>
       <button id="model-load" class="secondary" type="button" hidden>Retry</button>
     </div>
+  </div>
+  <main>
+    <header>
+      <p class="eyebrow">YOUR SPACE</p>
+      <h1>Your to-do list</h1>
+      <p>A little room for what matters.</p>
+    </header>
     <section class="card" aria-label="To-do items">
       <noscript><p>This page needs JavaScript to load, add, edit, complete, reopen, and remove your tasks. Enable JavaScript and reload the page.</p></noscript>
       <div class="list-heading">
@@ -32,10 +34,11 @@
       </div>
       <div class="search-row" role="search">
         <label class="sr-only" for="todo-search">Search tasks</label>
-        <input id="todo-search" type="search" placeholder="Search tasks…" maxlength="500" autocomplete="off" aria-describedby="search-status">
+        <input id="todo-search" type="search" placeholder="Search tasks…" maxlength="500" autocomplete="off" aria-describedby="search-status search-explain">
         <button id="search-clear" class="quiet-button" type="button" aria-label="Clear search" hidden>×</button>
       </div>
       <p id="search-status" role="status"></p>
+      <p id="search-explain" hidden>Similarity scores show cosine similarity: higher means closer meaning, not confidence.</p>
       <p id="status" role="status">Loading your tasks…</p>
       <ul id="todo-list" aria-label="Tasks"></ul>
       <button id="new-task" class="new-task" type="button" aria-expanded="false" aria-controls="todo-form"><span aria-hidden="true">＋</span> New task</button>

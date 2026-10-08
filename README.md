@@ -51,7 +51,7 @@ the task's completion state.
 
 The **×** remove control appears on hover or keyboard focus and stays visible
 on touch devices. It is announced as “Remove” and the saved task title.
-Removal is immediate. Focus moves to the next available task, the previous task,
+Removal is immediate. Focus moves to the next visible available task, the previous visible task,
 or the composer. Removing an edited task does not save its draft.
 Failed saves and removals leave the task and drafts available with a **Retry**
 control. Failed completion changes restore the last confirmed checkbox state;
@@ -67,20 +67,44 @@ Stop the server with Ctrl+C.
 
 ## Model loading and search
 
-EmbeddingGemma 2 loads automatically when the page opens. A compact indicator
-above the task card animates during setup and download; **Model ready** means a
-built-in sample produced valid output on WebGPU. Task controls remain usable
+EmbeddingGemma 2 loads automatically when the page opens. A full-width status
+bar above the page heading animates during setup and download; **Model ready**
+means a built-in sample produced valid output on WebGPU. Task controls remain usable
 while the model loads or if loading fails. Failure details and **Retry** appear
-in the indicator. Retry starts a fresh worker after a failure or timeout.
+in the status bar. Retry starts a fresh worker after a failure or timeout.
 
 Use **Search tasks** to find saved tasks by meaning, including completed tasks.
 For example, “purchase food” can find a grocery task. Queries accept 1–500
-characters and wait for model readiness. Results rank by cosine similarity to
-the query vector and show up to 20 tasks. The status reports when some tasks
-still lack embeddings, so an incomplete index is distinguishable from an empty
-one. Results update as indexing finishes. **Clear search**, or Escape in the
-search field, restores normal list order. Search updates preserve row drafts,
-retry controls, and keyboard focus.
+characters and wait for model readiness. Results include only tasks meeting the
+minimum cosine similarity, ranked from closest meaning to least, up to 20 tasks.
+Search may return **No matching tasks** even when all tasks are indexed.
+Each match shows its raw score, such as **Similarity 0.72**. Higher cosine
+similarity means closer meaning; it is not a confidence or probability score.
+The status reports when some tasks still lack embeddings, so an incomplete
+index is distinguishable from an empty
+one. Results update as indexing finishes. Search guidance uses the minimum score
+returned by the server. **Clear search**, or Escape in the
+search field, restores normal list order and removes search scores. The field
+has one **Clear search** control. Search updates preserve row drafts, retry
+controls, and keyboard focus. A nonmatching row retained for a draft, pending
+action or background processing, retry, or focus says **Not a search match**,
+has no score, and does not contribute to the result count. It disappears once
+its draft, pending action, error, or focus no longer needs protection. Changing
+a query or saved task source removes obsolete scores.
+
+The server uses an inclusive minimum cosine score of **0.70**, defined by
+`MIN_SEARCH_COSINE_SIMILARITY` in `app/db.py`. The pinned q4 model produced these
+scores with the saved task input format and icons below:
+
+| Query | Buy groceries (Shopping) | Read a novel (Star) |
+| --- | --- | --- |
+| purchase food | 0.739 | 0.616 |
+| read a story | 0.612 | 0.759 |
+| repair the spacecraft engine | 0.598 | 0.639 |
+
+This heuristic cutoff retains both paraphrases, excludes the unrelated task, and allows
+the spacecraft query to return no matches. These fixtures calibrate a useful
+default for this model; reassess the cutoff if the model or input format changes.
 
 When the model becomes ready, the app fetches saved tasks with missing or
 incompatible embeddings and processes them in the background. This includes
@@ -164,8 +188,9 @@ mise install node@22
 
 The full Python suite uses temporary databases and includes both offline Node
 suites. It covers task lifecycle and persistence, legacy database upgrades,
-embedding validation and atomic uploads, pending eligibility, cosine ranking
-and stable ties, and query/task inference serialization, failures, timeouts,
+embedding validation and atomic uploads, pending eligibility, cosine filtering
+at the inclusive cutoff, no-match queries, stable ties and limits, and
+query/task inference serialization, failures, timeouts,
 and disposal. Static checks verify JavaScript serving and wheel packaging;
 panel tests verify automatic startup and accessible state changes.
 Set `MODEL_TEST_NODE` to an absolute Node executable path if it is outside PATH
@@ -175,11 +200,11 @@ Install the optional browser setup and prepare the pinned fixtures:
 
 ```sh
 mise exec node@22 -- npm install --prefix .venv/model-browser --no-audit --no-fund playwright@1.55.1
-mise exec node@22 -- node .venv/model-browser/node_modules/playwright/cli.js install chromium
+mise exec node@22 -- node .venv/model-browser/node_modules/playwright/cli.js install chromium webkit
 .venv/bin/python tests/test_model_assets.py --download-fixtures
 ```
 
-Playwright reports missing native Chromium libraries on Linux. Fixture downloads
+Playwright reports missing native browser libraries on Linux. Fixture downloads
 are approximately 234 MB under the ignored `.venv/model-assets` directory and
 are verified against SHA-256 hashes; matching files are reused on later runs.
 
@@ -187,34 +212,59 @@ Run each browser check separately:
 
 ```sh
 .venv/bin/python tests/test_model_assets.py --check-flows
+.venv/bin/python tests/test_model_assets.py --check-focus
+.venv/bin/python tests/test_model_assets.py --check-webkit
 .venv/bin/python tests/test_model_assets.py --check-real
+.venv/bin/python tests/test_model_assets.py --check-real-book
+.venv/bin/python tests/test_model_assets.py --check-real-no-match
+.venv/bin/python tests/test_model_assets.py --check-real-cache
 ```
 
-Each command starts and stops its own FastAPI server and Chromium in the same
+Each command starts and stops its own FastAPI server and browser in the same
 process, with temporary databases and dynamically allocated loopback ports.
+The three authentic query fixtures and the cache/reload scenario run separately
+so each command fits the VM's 30-second check limit, including initial
+software-GPU compilation.
 The flow check injects model inference while exercising the real DOM, API, and
 DuckDB: additions during loading, saved-snapshot backfill, current-vector reuse,
 source edits/deletions during inference, 404/409 reconciliation, inference and
-upload retries, rapid searches, clearing, and draft/focus preservation.
+upload retries, rapid searches, scores, no-match and request-error states,
+clear/Escape, and draft/focus preservation for retained nonmatching rows.
 Browser actions await matching responses registered before the action and then
 assert the rendered state. Controlled request gates cover pending creation and
 saves; held search responses arrive after a newer query, clearing, or a source
 save to verify that obsolete results cannot overwrite the current view.
+A gated cross-tab source edit also verifies that the page refreshes before
+showing the new score, preserving a focused local draft and its selection
+without submitting it, including recovery after a failed source refresh.
 
-The real-model check uses the deployed worker and authentic pinned bytes in
-Chromium's browser cache. It verifies automatic activation, loading failure and
-retry, missing-item backfill, semantic ranking, cache reuse after reload, and
-persisted vectors after a server restart. Both browser checks include a narrow
-layout and reduced motion. Chromium uses SwiftShader software WebGPU in the
-Linux VM; physical GPU and browser performance varies. The real check also
-verifies that unsupported WebGPU leaves task controls available.
+The focus checks use controlled inference and request gates with the real DOM,
+API, and DuckDB in Chromium and WebKit (Safari's browser engine). They cover
+focused and drafted nonmatches, save and processing retries, pending completion,
+held processing uploads remaining accessible after focus leaves, rows hiding
+after a blur to the page body or other protection ends, and deletion moving focus
+past hidden rows or to the composer. Desktop and 375px screenshots show the top
+model bar and one search clear control. They also check keyboard use, reduced motion, and
+model failure/retry. Search guidance must reflect the response's `min_score`.
+
+The real-model scenarios use the deployed worker and authentic pinned bytes in
+Chromium's browser cache. They verify automatic activation, loading failure and
+retry, missing-item backfill, paraphrase matches and unrelated-task exclusion,
+an unrelated query with no matches, cache reuse after reload, and
+persisted vectors after a server restart. Browser checks include a narrow
+layout, the top status bar, the hidden native search cancel control and reduced
+motion. Browser screenshots are saved under the ignored
+`.venv/browser-screenshots` directory for desktop and narrow inspection, with
+browser and scenario names in each filename.
+Chromium uses SwiftShader software WebGPU in the
+Linux VM; physical GPU and browser performance varies. The cache/reload scenario
+also verifies that unsupported WebGPU leaves task controls available.
 On reload, reaching the sample-test phase confirms that the fresh worker loaded
-the cached tokenizer and weights. The check then stops Chromium before waiting
-for a second software-GPU sample; the first sample and real inference already
-passed.
+the cached tokenizer and weights. The cache/reload check stops Chromium at that
+point; its first sample and real task inference have already passed.
 
 Browser tests are opt-in under ordinary pytest runs. Set `MODEL_BROWSER_CHECK=1`
-to include them, or use the two commands above.
+to include them, or use the browser commands above.
 
 The API is available at `GET /api/todos`, `POST /api/todos` (JSON body
 `{"title": "Buy groceries", "icon": "shopping"}`), `PUT /api/todos/{id}`
@@ -247,8 +297,14 @@ model, revision, input version, dimensions, and a usable finite nonzero vector.
 `POST /api/todos/search` accepts
 `{vector, model, revision, input_version, dimensions, limit?}` with the same
 vector validation as uploads. `limit` defaults to 20 and must be an integer from
-1 to 100. The response is `{matches: [{todo, score}], pending_count}`. Only
-compatible vectors are ranked by descending cosine similarity, with ties in
+1 to 100. The response is `{matches: [{todo, score}], pending_count, min_score}`.
+`min_score` is the server-owned inclusive cutoff, currently **0.70**, and is
+included even when there are no matches. It is a heuristic cosine threshold,
+not a probability; clients cannot override it in the request. Only
+compatible vectors with cosine score **at least `min_score`** are ranked by descending
+similarity, with ties in
 creation-time/ID order; `pending_count` reports tasks still missing compatible
 vectors. Invalid input returns a sanitized 422 response. An empty index returns
-an empty `matches` list.
+an empty `matches` list, as does a query with no sufficiently similar tasks.
+Weak compatible matches are excluded rather than used to fill the limit, and
+do not increase `pending_count`.

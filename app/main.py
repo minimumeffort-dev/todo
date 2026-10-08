@@ -93,6 +93,7 @@ class SearchMatch(BaseModel):
 class SearchResults(BaseModel):
     matches: list[SearchMatch]
     pending_count: int
+    min_score: float
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:

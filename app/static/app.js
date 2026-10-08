@@ -11,6 +11,7 @@ const error = document.querySelector('#error');
 const searchInput = document.querySelector('#todo-search');
 const searchClear = document.querySelector('#search-clear');
 const searchStatus = document.querySelector('#search-status');
+const searchExplain = document.querySelector('#search-explain');
 // Keep controls available on touch devices even when a keyboard or mouse is used.
 document.documentElement.classList.toggle('touch-device', navigator.maxTouchPoints > 0);
 const icons = {
@@ -37,6 +38,7 @@ let pumpingBackfill = false;
 let searchSequence = 0;
 let searchTimer = null;
 let searchMatches = null;
+const searchScores = new Map();
 let queryEmbedding = null;
 let arrangingRows = false;
 // The page-level model panel owns activation; share its resident runtime.
@@ -98,6 +100,10 @@ function renderJob(job) {
   if (state) {
     state.embedding = embeddingJobs.get(job.id) ?? null;
     state.renderEmbedding();
+    // Embedding protection (a pending retry or a new failure) changes search
+    // visibility: surface newly protected rows and hide settled ones without
+    // waiting for the next keystroke. Retained rows stay unscored nonmatches.
+    if (searchMatches !== null) applySearchView();
   }
 }
 function invalidateEmbedding(state, confirmed) {
@@ -192,12 +198,38 @@ function setSearchStatus(message = '') {
   searchStatus.textContent = message;
   searchStatus.hidden = !message;
 }
+function formatSimilarity(score) {
+  return `Similarity ${Number(score).toFixed(2)}`;
+}
+// The static #search-explain copy is the fallback. Each successful response
+// may carry the server-owned cutoff (min_score); render it verbatim so the
+// guidance always explains the cutoff that actually filtered these results
+// instead of a value hard-coded in the page.
+const defaultSearchGuidance = searchExplain?.textContent ?? '';
+function renderSearchGuidance(minScore) {
+  if (!searchExplain) return;
+  searchExplain.textContent = Number.isFinite(minScore)
+    ? `Only tasks scoring at least ${Number(minScore).toFixed(2)} are shown. ${defaultSearchGuidance}`
+    : defaultSearchGuidance;
+}
+function clearSearchScores() {
+  searchScores.clear();
+  if (searchExplain) {
+    searchExplain.textContent = defaultSearchGuidance;
+    searchExplain.hidden = true;
+  }
+}
 function applySearchView() {
   const active = Boolean(searchInput?.value.trim()) && searchMatches !== null;
   const matches = new Set(searchMatches ?? []);
   const pinned = state => state.editing || state.pending || state.hasError || state.embedding?.error
+    || state.embedding?.pending
     || !sameSource(state.draft, state.item) || state.row.contains(document.activeElement);
-  for (const [id, state] of rows) state.row.hidden = active && !matches.has(id) && !pinned(state);
+  for (const [id, state] of rows) {
+    const matched = matches.has(id);
+    state.row.hidden = active && !matched && !pinned(state);
+    if (state.renderSearch) state.renderSearch({ active, matched, score: searchScores.get(id) });
+  }
   const order = active ? [...searchMatches, ...normalOrder.filter(id => !matches.has(id))] : normalOrder;
   const focused = document.activeElement;
   const selection = focused?.classList?.contains('task-editor')
@@ -228,6 +260,7 @@ function scheduleSearch(delay = 250) {
   if (!query) {
     searchMatches = null;
     queryEmbedding = null;
+    clearSearchScores();
     setSearchStatus();
     applySearchView();
     return;
@@ -251,13 +284,49 @@ async function runSearch(query, sequence) {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result),
     });
     if (sequence !== searchSequence) return;
+    const resync = response.matches.some(match => {
+      const state = rows.get(match.todo.id);
+      return state && !sameSource(state.item, match.todo);
+    });
+    if (resync) {
+      // A saved source changed elsewhere (for example in another tab). Never
+      // label the stale title with the new score: drop obsolete scores,
+      // refresh the list while preserving drafts and focus, then rerun this
+      // query once the list is current.
+      searchMatches = null;
+      searchScores.clear();
+      if (searchExplain) searchExplain.hidden = true;
+      applySearchView();
+      setSearchStatus('Searching…');
+      void resyncSources(query, sequence);
+      return;
+    }
     searchMatches = response.matches.map(match => match.todo.id).filter(id => rows.has(id));
+    searchScores.clear();
+    for (const match of response.matches) {
+      if (rows.has(match.todo.id) && Number.isFinite(match.score)) searchScores.set(match.todo.id, match.score);
+    }
     applySearchView();
-    setSearchStatus(response.pending_count > 0
-      ? `${searchMatches.length} results · ${response.pending_count} tasks still being indexed`
-      : searchMatches.length ? `${searchMatches.length} results` : 'No indexed tasks found.');
+    renderSearchGuidance(response.min_score);
+    if (searchExplain) searchExplain.hidden = searchMatches.length === 0;
+    const found = searchMatches.length;
+    const summary = found ? `${found} results` : 'No matching tasks';
+    setSearchStatus(response.pending_count > 0 ? `${summary} · ${response.pending_count} tasks still being indexed` : summary);
   } catch (exception) {
     if (sequence === searchSequence) setSearchStatus(exception.message);
+  }
+}
+// Reconcile cross-tab source changes for a search whose response no longer
+// matches the displayed rows. A refresh discarded by concurrent edits (or
+// skipped while busy) schedules no rerun itself, so retry while this query is
+// still current. Refreshing preserves drafts and focus inside loadItems, and
+// the rerun goes through scheduleSearch, keeping stale-response guards.
+async function resyncSources(query, sequence) {
+  for (;;) {
+    if (sequence !== searchSequence) return;
+    if ((searchInput?.value.trim() ?? '') !== query) return;
+    if (await loadItems()) return;
+    await new Promise(resolve => setTimeout(resolve, 150));
   }
 }
 function tasksChanging() {
@@ -268,6 +337,7 @@ function tasksChanging() {
 function tasksChanged({ backfill = false } = {}) {
   ++sourceEpoch;
   searchMatches = null;
+  clearSearchScores();
   applySearchView();
   scheduleSearch();
   if (backfill) requestBackfill();
@@ -401,6 +471,14 @@ function makeRow(item) {
   embeddingMessage.className = 'error';
   embeddingMessage.setAttribute('role', 'alert');
   const embeddingRetry = button('retry embedding-retry', 'Retry');
+  const similarity = document.createElement('p');
+  similarity.className = 'row-status similarity';
+  similarity.setAttribute('role', 'status');
+  similarity.hidden = true;
+  const nonmatch = document.createElement('p');
+  nonmatch.className = 'row-status nonmatch';
+  nonmatch.textContent = 'Not a search match';
+  nonmatch.hidden = true;
   editor.setAttribute('aria-describedby', `edit-help ${message.id}`);
   title.setAttribute('aria-describedby', 'edit-help');
   completion.setAttribute('aria-describedby', message.id);
@@ -422,6 +500,12 @@ function makeRow(item) {
     if (retryFocused && embeddingFeedback.hidden) {
       (state.editing ? editor : title).focus();
     }
+  };
+  state.renderSearch = ({ active, matched, score }) => {
+    const showScore = Boolean(active && matched) && Number.isFinite(score);
+    similarity.textContent = showScore ? formatSimilarity(score) : '';
+    similarity.hidden = !showScore;
+    nonmatch.hidden = !(active && !matched);
   };
   embeddingRetry.addEventListener('click', () => {
     const job = embeddingJobs.get(item.id);
@@ -572,9 +656,20 @@ function makeRow(item) {
     rowError();
     try {
       await request(`/api/todos/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
-      const adjacent = [row.nextElementSibling, row.previousElementSibling]
-        .map(element => element && rows.get(element.dataset.id))
-        .find(candidate => candidate && (!candidate.pending || (candidate.editing && candidate.pending === 'save')));
+      // Focus must land on a visible row: filtered-out matches are hidden and
+      // cannot receive focus. Scan outward from the removed row instead of
+      // only checking its immediate neighbours.
+      const eligible = candidate => Boolean(candidate) && !candidate.row.hidden
+        && (!candidate.pending || (candidate.editing && candidate.pending === 'save'));
+      let adjacent = null;
+      for (let element = row.nextElementSibling; element && !adjacent; element = element.nextElementSibling) {
+        const candidate = rows.get(element.dataset.id);
+        if (eligible(candidate)) adjacent = candidate;
+      }
+      for (let element = row.previousElementSibling; element && !adjacent; element = element.previousElementSibling) {
+        const candidate = rows.get(element.dataset.id);
+        if (eligible(candidate)) adjacent = candidate;
+      }
       const restoreFocus = hadFocus && (row.contains(document.activeElement) || document.activeElement === document.body);
       invalidateEmbedding(state, null);
       rows.delete(item.id);
@@ -639,19 +734,21 @@ function makeRow(item) {
   feedback.append(message, retry);
   embeddingFeedback.append(embeddingMessage, embeddingRetry);
   content.append(title, editor);
-  row.append(completionControl, iconContainer, content, remove, rowStatus, feedback, embeddingStatus, embeddingFeedback);
+  row.append(completionControl, iconContainer, content, remove, rowStatus, feedback, embeddingStatus, embeddingFeedback, similarity, nonmatch);
   list.append(row);
 }
 
 async function loadItems() {
-  if (loading || adding || [...rows.values()].some(state => state.pending)) return;
+  // Reports whether the refresh applied: only then has tasksChanged()
+  // rescheduled dependent work such as an awaiting search reconciliation.
+  if (loading || adding || [...rows.values()].some(state => state.pending)) return false;
   const snapshot = revision;
   loading = true;
   updateRefresh();
   showError();
   try {
     const items = await request('/api/todos');
-    if (snapshot !== revision) return;
+    if (snapshot !== revision) return false;
     const byId = new Map(items.map(item => [item.id, item]));
     for (const [id, state] of rows) {
       const dirty = state.draft.title !== state.item.title || state.draft.icon !== state.item.icon;
@@ -665,18 +762,31 @@ async function loadItems() {
       else {
         const updated = byId.get(id);
         invalidateEmbedding(state, updated);
-        if (preserveDraft) state.item = updated;
-        else {
-          state.item = updated;
+        const oldItem = state.item;
+        // Focus alone protects the row from removal, not its draft: rebase
+        // untouched fields onto the refreshed source while preserving actual
+        // edits, so leaving the editor without typing never PUTs stale text.
+        const userEdited = state.editing
+          || state.draft.title !== oldItem.title
+          || state.draft.icon !== oldItem.icon;
+        state.item = updated;
+        if (userEdited) {
+          if (state.draft.title === oldItem.title) state.draft.title = updated.title;
+          if (state.draft.icon === oldItem.icon) state.draft.icon = updated.icon;
+        } else {
           state.draft = { title: updated.title, icon: updated.icon };
         }
+        const editorFocused = state.editing && document.activeElement === state.editor;
+        const selection = editorFocused ? [state.editor.selectionStart, state.editor.selectionEnd] : null;
         state.sync();
+        if (selection) state.editor.setSelectionRange(...selection);
       }
     }
     for (const item of items) if (!rows.has(item.id)) makeRow(item);
     normalOrder = [...items.map(item => item.id), ...normalOrder.filter(id => rows.has(id) && !byId.has(id))];
     updateCount();
     tasksChanged();
+    return true;
   } catch (exception) {
     showError(exception.message);
     if (!rows.size) { status.textContent = 'Could not load your tasks. Try Refresh.'; status.hidden = false; }
@@ -767,6 +877,7 @@ form.addEventListener('submit', async event => {
 refreshButton.addEventListener('click', loadItems);
 searchInput?.addEventListener('input', () => {
   searchMatches = null;
+  clearSearchScores();
   applySearchView();
   scheduleSearch();
 });
@@ -781,5 +892,24 @@ searchInput?.addEventListener('keydown', event => {
     searchInput.value = '';
     scheduleSearch(0);
   }
+});
+// A retained nonmatch stays visible only while it is protected (draft,
+// pending work, an error, or focus). Re-evaluate once focus settles
+// elsewhere so unprotected rows hide promptly instead of lingering until
+// the next keystroke. The arrangingRows guard avoids re-entering from the
+// focus restore inside applySearchView.
+document.addEventListener('focusin', () => {
+  if (arrangingRows || searchMatches === null) return;
+  applySearchView();
+});
+// Blurring to a non-focusable target (heading, background, or body) fires no
+// focusin, so a focus-only retained row would linger. Reevaluate once focus
+// settles instead; the guard skips internal DOM moves like focusin does.
+document.addEventListener('focusout', () => {
+  if (arrangingRows || searchMatches === null) return;
+  setTimeout(() => {
+    if (arrangingRows || searchMatches === null) return;
+    applySearchView();
+  }, 0);
 });
 loadItems();
