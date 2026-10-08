@@ -5,6 +5,12 @@ tasks as done, and reopen them later. Completed tasks stay in the list. Saved
 tasks and their completion states remain after reloading the page or restarting
 the app.
 
+## Built with Sprowt Harness
+
+This is the sample app I’m building with [Sprowt Harness](https://github.com/minimumeffort-dev/sprowt.harness), my local coding harness for Codex and Muse. I’m developing the app alongside the harness so its commits and pull requests provide a concrete record of the work.
+
+Follow the [app’s commits](https://github.com/minimumeffort-dev/todo/commits/main/) and [pull requests](https://github.com/minimumeffort-dev/todo/pulls), browse the [harness](https://github.com/minimumeffort-dev/sprowt.harness), or read the [build notes](https://minimumeffort.dev/blog). Both projects are in development.
+
 ## Install
 
 Use Python 3.10 or newer. The app was verified with Python 3.12.
