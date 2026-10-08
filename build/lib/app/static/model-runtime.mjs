@@ -1,5 +1,5 @@
 // This module does not import Transformers.js or create a worker until activation.
-import { MODEL_ARTIFACT, TASK_INPUT_VERSION, taskSnapshot, queryText } from './model-worker.mjs';
+import { MODEL_ARTIFACT, TASK_INPUT_VERSION, taskSnapshot } from './model-worker.mjs';
 
 const IDLE = Object.freeze({
   phase: 'idle', progress: null, message: 'Load EmbeddingGemma 2 on this device.',
@@ -75,7 +75,7 @@ export function createModelRuntime({
     embedding = queue.shift();
     watch();
     try {
-      worker.postMessage({ type: embedding.type, id: embedding.id, ...embedding.snapshot });
+      worker.postMessage({ type: 'embed-task', id: embedding.id, ...embedding.snapshot });
     } catch {
       fail('error', 'The model worker could not receive this task. Reload the model and retry.');
     }
@@ -89,22 +89,17 @@ export function createModelRuntime({
     }
     const result = data.result;
     const valid = data.type === 'embedding'
-      && result && (embedding.type === 'embed-query'
-        || (result.title === embedding.snapshot.title && result.icon === embedding.snapshot.icon))
+      && result?.title === embedding.snapshot.title && result?.icon === embedding.snapshot.icon
       && result.model === MODEL_ARTIFACT.id && result.revision === MODEL_ARTIFACT.revision
       && result.input_version === TASK_INPUT_VERSION && result.dimensions === MODEL_ARTIFACT.dimensions
       && Array.isArray(result.vector) && result.vector.length === MODEL_ARTIFACT.dimensions
       && Array.from(result.vector).every(value => Number.isFinite(value) && Number.isFinite(Math.fround(value)))
       && result.vector.some(value => Math.fround(value) !== 0);
     if (!valid) {
-      finishEmbedding(new Error(`The model returned an invalid ${embedding.type === 'embed-task' ? 'task' : 'query'} embedding. Please retry.`));
+      finishEmbedding(new Error('The model returned an invalid task embedding. Please retry.'));
       return;
     }
-    finishEmbedding(null, {
-      ...(embedding.type === 'embed-task' ? embedding.snapshot : {}),
-      vector: [...result.vector], model: result.model, revision: result.revision,
-      input_version: result.input_version, dimensions: result.dimensions,
-    });
+    finishEmbedding(null, { ...result, vector: [...result.vector] });
   }
 
   function embedTask(task) {
@@ -114,20 +109,7 @@ export function createModelRuntime({
       return Promise.reject(new Error('Load the model before embedding a task.'));
     }
     const promise = new Promise((resolve, reject) => {
-      queue.push({ type: 'embed-task', id: ++sequence, snapshot, resolve, reject });
-    });
-    startNextEmbedding();
-    return promise;
-  }
-
-  function embedQuery(query) {
-    let text;
-    try { text = queryText(query); } catch (error) { return Promise.reject(error); }
-    if (state.phase !== 'ready' || !worker) {
-      return Promise.reject(new Error('Load the model before searching.'));
-    }
-    const promise = new Promise((resolve, reject) => {
-      queue.push({ type: 'embed-query', id: ++sequence, snapshot: { query: text }, resolve, reject });
+      queue.push({ id: ++sequence, snapshot, resolve, reject });
     });
     startNextEmbedding();
     return promise;
@@ -221,7 +203,7 @@ export function createModelRuntime({
     publish(IDLE.phase, IDLE.progress, IDLE.message);
   }
 
-  return Object.freeze({ loadAndTest, embedTask, embedQuery, subscribe, dispose });
+  return Object.freeze({ loadAndTest, embedTask, subscribe, dispose });
 }
 
 export const modelRuntime = createModelRuntime();

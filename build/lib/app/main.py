@@ -43,9 +43,12 @@ class TodoCompletion(BaseModel):
     completed: StrictBool
 
 
-class QueryEmbedding(BaseModel):
+class TaskEmbedding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Do not trim a source snapshot: it must match the confirmed saved values.
+    title: str = Field(strict=True, min_length=1, max_length=500)
+    icon: TodoIcon
     vector: list[Float32Value] = Field(
         min_length=EMBEDDING_DIMENSIONS, max_length=EMBEDDING_DIMENSIONS
     )
@@ -68,31 +71,11 @@ class QueryEmbedding(BaseModel):
         return converted
 
 
-class TaskEmbedding(QueryEmbedding):
-    # Do not trim a source snapshot: it must match the confirmed saved values.
-    title: str = Field(strict=True, min_length=1, max_length=500)
-    icon: TodoIcon
-
-
-class TodoSearch(QueryEmbedding):
-    limit: StrictInt = Field(default=20, ge=1, le=100)
-
-
 class Todo(BaseModel):
     id: str
     title: str
     icon: TodoIcon
     completed: bool
-
-
-class SearchMatch(BaseModel):
-    todo: Todo
-    score: float
-
-
-class SearchResults(BaseModel):
-    matches: list[SearchMatch]
-    pending_count: int
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
@@ -117,16 +100,6 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @application.get("/api/todos", response_model=list[Todo])
     def list_todos():
         return store.list()
-
-    @application.get("/api/todos/embeddings/pending", response_model=list[Todo])
-    def pending_embeddings():
-        return store.pending_embeddings(
-            EMBEDDING_MODEL, EMBEDDING_REVISION, EMBEDDING_INPUT_VERSION, EMBEDDING_DIMENSIONS
-        )
-
-    @application.post("/api/todos/search", response_model=SearchResults)
-    def search_todos(item: TodoSearch):
-        return store.search(**item.model_dump())
 
     @application.post("/api/todos", response_model=Todo, status_code=201)
     def add_todo(item: TodoInput):
@@ -157,7 +130,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @application.exception_handler(RequestValidationError)
     async def invalid_input(request: Request, error: RequestValidationError):
-        if request.scope.get("endpoint") in (save_todo_embedding, search_todos):
+        if request.scope.get("endpoint") is save_todo_embedding:
             # Non-finite inputs can be parsed from JSON, but cannot be echoed in
             # JSON error responses. Return useful field errors without the vector
             # or non-serializable validator context, including for NaN/Infinity.

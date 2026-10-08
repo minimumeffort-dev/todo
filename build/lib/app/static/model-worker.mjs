@@ -24,13 +24,6 @@ export function taskSnapshot(task) {
   return { title: task.title, icon: task.icon };
 }
 
-export function queryText(query) {
-  if (typeof query !== 'string' || !query.trim() || [...query.trim()].length > 500) {
-    throw new Error('Use a search query with 1–500 characters.');
-  }
-  return query.trim();
-}
-
 class ModelFailure extends Error {
   constructor(phase, message) {
     super(message);
@@ -221,13 +214,12 @@ export function createModelWorker({
     };
     try {
       if (current !== generation) return;
-      const isQuery = message.type === 'embed-query';
-      const snapshot = isQuery ? {} : taskSnapshot(message);
-      const text = isQuery ? queryText(message.query) : `Icon: ${snapshot.icon}\nTask: ${snapshot.title}`;
-      if (!ready || !model || !tokenizer) throw new Error('Load the model before embedding.');
+      const snapshot = taskSnapshot(message);
+      if (!ready || !model || !tokenizer) throw new Error('Load the model before embedding a task.');
       // Input format v1 is one text embedding with the saved icon's text key.
       // Titles are bounded to 500 characters; retain their entire tokenized input.
-      inputs = tokenizer(text, { padding: true, truncation: false });
+      inputs = tokenizer(`Icon: ${snapshot.icon}\nTask: ${snapshot.title}`,
+        { padding: true, truncation: false });
       output = await model(inputs);
       if (current !== generation) return;
       const vector = validateEmbedding(output, artifact.dimensions);
@@ -238,8 +230,7 @@ export function createModelWorker({
     } catch {
       // A task failure is separate from model loading. Keep the resident model
       // and allow a retry; crashes/timeouts are handled by the parent runtime.
-      send({ type: 'embedding-error', message: message.type === 'embed-query'
-        ? 'Could not search with this query. Please retry.' : 'Could not embed this task. Please retry.' });
+      send({ type: 'embedding-error', message: 'Could not embed this task. Please retry.' });
     } finally {
       discardTensors(inputs, output);
     }
@@ -253,11 +244,10 @@ export function createModelWorker({
 
   function handleMessage(message) {
     if (!Number.isSafeInteger(message?.id) || message.id < 1) return Promise.resolve();
-    if (message.type === 'embed-task' || message.type === 'embed-query') {
+    if (message.type === 'embed-task') {
       const current = generation;
       // Capture source fields now so a queued caller cannot change the snapshot.
-      const snapshot = { type: message.type, id: message.id,
-        title: message.title, icon: message.icon, query: message.query };
+      const snapshot = { id: message.id, title: message.title, icon: message.icon };
       return enqueue(() => runEmbedding(snapshot, current));
     }
     if (message.type !== 'load-and-test') return Promise.resolve();
