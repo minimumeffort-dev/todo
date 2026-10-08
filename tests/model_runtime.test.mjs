@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { createModelRuntime, modelRuntime } from '../app/static/model-runtime.mjs';
 import {
   createModelWorker, MODEL_ARTIFACT, TRANSFORMERS_URL, TRANSFORMERS_VERSION,
@@ -351,6 +353,83 @@ test('worker crashes, message errors and disposal settle every pending embedding
     await assertions;
     assert.equal(workers[0].terminated, true);
     assert.equal(states.at(-1).phase, kind === 'dispose' ? 'idle' : 'error');
+    runtime.dispose();
+  }
+});
+
+test('queries trim and validate text, serialize with tasks, and return only query metadata', async () => {
+  const { runtime, workers } = runtimeFixture();
+  await assert.rejects(runtime.embedQuery('shopping'), /Load the model/);
+  for (const query of [null, 1, {}, '', '  ', 'x'.repeat(501)]) {
+    await assert.rejects(runtime.embedQuery(query), /1–500/);
+  }
+  assert.equal(workers.length, 0);
+  const loading = runtime.loadAndTest();
+  workers[0].succeed();
+  await loading;
+  const worker = workers[0];
+  const task = runtime.embedTask({ title: 'Saved groceries', icon: 'shopping' });
+  const query = runtime.embedQuery('  buy food  ');
+  const nextTask = runtime.embedTask({ title: 'Saved chores', icon: 'home' });
+  assert.equal(worker.messages.length, 2);
+  answerEmbedding(worker, embeddingResult({ title: 'Saved groceries', icon: 'shopping' }));
+  await task;
+  assert.deepEqual(worker.messages.at(-1), { type: 'embed-query', id: 3, query: 'buy food' });
+  const result = embeddingResult({});
+  answerEmbedding(worker, result);
+  const received = await query;
+  assert.deepEqual(received, result);
+  result.vector[0] = 42;
+  assert.equal(received.vector[0], 0.5);
+  assert.deepEqual(worker.messages.at(-1), { type: 'embed-task', id: 4, title: 'Saved chores', icon: 'home' });
+  answerEmbedding(worker, embeddingResult({ title: 'Saved chores', icon: 'home' }));
+  await nextTask;
+  runtime.dispose();
+});
+
+test('query metadata failures reject independently and a subsequent query can succeed', async () => {
+  const { runtime, workers, states } = runtimeFixture();
+  const loading = runtime.loadAndTest();
+  workers[0].succeed();
+  await loading;
+  for (const changes of [{ model: 'wrong' }, { revision: 'main' }, { input_version: 2 },
+    { dimensions: 2 }, { vector: [] }, { vector: Array(768).fill(0) },
+    { vector: Array(768).fill(NaN) }, { vector: Array(768).fill(1e100) },
+    { vector: Array(768).fill(1e-100) }, { vector: Array(768).fill('1') }]) {
+    const query = runtime.embedQuery('food');
+    const rejection = assert.rejects(query, /invalid query embedding/);
+    answerEmbedding(workers[0], embeddingResult({}, changes));
+    await rejection;
+    assert.equal(states.at(-1).phase, 'ready');
+  }
+  const failure = runtime.embedQuery('food');
+  const rejected = assert.rejects(failure, /Temporary query failure/);
+  workers[0].onmessage({ data: { id: workers[0].messages.at(-1).id,
+    type: 'embedding-error', message: 'Temporary query failure' } });
+  await rejected;
+  const retry = runtime.embedQuery('food');
+  answerEmbedding(workers[0], embeddingResult({}));
+  await retry;
+  assert.equal(workers.length, 1);
+  runtime.dispose();
+});
+
+test('query timeouts, worker failures and disposal also reject queued tasks', async () => {
+  for (const kind of ['timeout', 'crash', 'messageerror', 'dispose']) {
+    const { runtime, workers } = runtimeFixture({ inactivityTimeoutMs: 10 });
+    const loading = runtime.loadAndTest();
+    workers[0].succeed();
+    await loading;
+    const query = runtime.embedQuery('food');
+    const task = runtime.embedTask({ title: 'Queued task', icon: 'task' });
+    const expectation = kind === 'dispose' ? { name: 'AbortError' } : /stopped responding|worker/i;
+    const rejected = Promise.all([assert.rejects(query, expectation), assert.rejects(task, expectation)]);
+    if (kind === 'timeout') await delay(30);
+    if (kind === 'crash') workers[0].onerror({});
+    if (kind === 'messageerror') workers[0].onmessageerror();
+    if (kind === 'dispose') runtime.dispose();
+    await rejected;
+    assert.equal(workers[0].terminated, true);
     runtime.dispose();
   }
 });
@@ -724,6 +803,54 @@ test('invalid and unloaded task messages cannot download or infer', async () => 
   await fixture.handler.dispose();
 });
 
+test('worker query and task inference share one resident model and release query tensors', async () => {
+  let release;
+  let calls = 0;
+  let inFlight = 0;
+  let maximum = 0;
+  const inputs = [];
+  const outputs = [];
+  const fixture = workerFixture({
+    tokenize: () => { const input = { input_ids: tensor() }; inputs.push(input); return input; },
+    inference: async () => {
+      ++calls;
+      maximum = Math.max(maximum, ++inFlight);
+      if (calls === 2) await new Promise(resolve => { release = resolve; });
+      --inFlight;
+      const output = { sentence_embedding: tensor() };
+      outputs.push(output);
+      return output;
+    },
+  });
+  await fixture.handler.handleMessage({ type: 'embed-query', id: 1, query: 'No model' });
+  assert.equal(fixture.states.at(-1).type, 'embedding-error');
+  assert.equal(fixture.calls.length, 0);
+  await fixture.handler.handleMessage({ type: 'load-and-test', id: 2 });
+  const query = fixture.handler.handleMessage({ type: 'embed-query', id: 3, query: '  buy food  ' });
+  const task = fixture.handler.handleMessage({ type: 'embed-task', id: 4, title: 'Saved task', icon: 'task' });
+  await delay(0);
+  assert.equal(calls, 2);
+  release();
+  await Promise.all([query, task]);
+  assert.equal(maximum, 1);
+  assert.deepEqual(fixture.calls.filter(call => call[0] === 'tokenize').slice(-2).map(call => call[1]),
+    ['buy food', 'Icon: task\nTask: Saved task']);
+  assert.deepEqual(fixture.states.find(state => state.id === 3), { id: 3, type: 'embedding', result: {
+    vector: Array.from(new Float32Array([0.6, 0.8])), model: fixtureArtifact.id,
+    revision: fixtureArtifact.revision, input_version: 1, dimensions: 2,
+  } });
+  const before = fixture.calls.length;
+  for (const invalid of ['', '   ', 12, 'x'.repeat(501)]) {
+    await fixture.handler.handleMessage({ type: 'embed-query', id: 5, query: invalid });
+    assert.equal(fixture.states.at(-1).type, 'embedding-error');
+  }
+  assert.equal(fixture.calls.length, before);
+  assert.equal(fixture.model.disposed, false);
+  assert.ok(inputs.every(input => input.input_ids.disposed));
+  assert.ok(outputs.every(output => output.sentence_embedding.disposed));
+  await fixture.handler.dispose();
+});
+
 test('worker disposal during embedding releases late tensors and suppresses active and queued results', async () => {
   let release;
   let call = 0;
@@ -783,6 +910,364 @@ test('unrecognized worker messages cannot import, download, or infer', async () 
   }
   assert.equal(fixture.calls.length, 0);
   assert.equal(fixture.states.length, 0);
+});
+
+// Small DOM and local API fixtures run the deployed app orchestration offline.
+// Model inference is injected, while actual app event handlers and requests run.
+class AppElement {
+  constructor(document, tag = 'div') {
+    this.document = document;
+    this.tagName = tag;
+    this.children = [];
+    this.parent = null;
+    this.listeners = new Map();
+    this.dataset = {};
+    this.attributes = {};
+    this.value = '';
+    this.hidden = false;
+    this.className = '';
+    this.classList = {
+      contains: name => this.className.split(' ').includes(name),
+      toggle: (name, enabled) => {
+        const names = new Set(this.className.split(' ').filter(Boolean));
+        if (enabled) names.add(name); else names.delete(name);
+        this.className = [...names].join(' ');
+      },
+    };
+  }
+  setAttribute(name, value) { this.attributes[name] = value; }
+  addEventListener(type, callback) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(callback);
+  }
+  async emit(type, extra = {}) {
+    for (const callback of this.listeners.get(type) ?? []) {
+      await callback({ target: this, preventDefault() {}, stopPropagation() {}, ...extra });
+    }
+  }
+  append(...elements) { for (const element of elements) this.insertBefore(element, null); }
+  insertBefore(element, before) {
+    if (element.parent && element.contains(this.document.activeElement)) {
+      // Model browsers that blur descendants when a DOM subtree moves.
+      let focused = this.document.activeElement;
+      this.document.activeElement = this.document.body;
+      while (focused) {
+        for (const callback of focused.listeners.get('focusout') ?? []) callback({ relatedTarget: null });
+        focused = focused.parent;
+      }
+    }
+    element.remove();
+    element.parent = this;
+    const index = before ? this.children.indexOf(before) : this.children.length;
+    this.children.splice(index, 0, element);
+  }
+  remove() {
+    if (!this.parent) return;
+    this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = null;
+  }
+  contains(element) { return element === this || this.children.some(child => child.contains(element)); }
+  focus() { this.document.activeElement = this; }
+  setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
+  get firstElementChild() { return this.children[0] ?? null; }
+  get nextElementSibling() { return this.parent?.children[this.parent.children.indexOf(this) + 1] ?? null; }
+  get previousElementSibling() { return this.parent?.children[this.parent.children.indexOf(this) - 1] ?? null; }
+  find(className) {
+    if (this.classList.contains(className)) return this;
+    for (const child of this.children) { const found = child.find(className); if (found) return found; }
+    return null;
+  }
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(accept => { resolve = accept; });
+  return { promise, resolve };
+}
+const copy = value => JSON.parse(JSON.stringify(value));
+function apiResponse(body, status = 200) {
+  return { ok: status >= 200 && status < 300, status, json: async () => copy(body) };
+}
+async function until(predicate) {
+  for (let attempt = 0; attempt < 100; ++attempt) {
+    if (predicate()) return;
+    await delay(5);
+  }
+  assert.ok(predicate(), 'The expected app effect did not settle');
+}
+
+function appFixture({ items = [], current = [], phase = 'loading', embedTask, embedQuery, onFetch } = {}) {
+  const elements = new Map();
+  const document = {
+    addEventListener() {},
+    createElement: tag => new AppElement(document, tag),
+    createTextNode: text => Object.assign(new AppElement(document, 'text'), { textContent: text }),
+    querySelector: selector => {
+      if (!elements.has(selector)) elements.set(selector, new AppElement(document));
+      return elements.get(selector);
+    },
+  };
+  document.body = new AppElement(document, 'body');
+  document.documentElement = new AppElement(document, 'html');
+  document.activeElement = document.body;
+  const tasks = new Map(items.map(item => [item.id, copy(item)]));
+  const embedded = new Set(current);
+  const uploads = [];
+  const taskCalls = [];
+  const queryCalls = [];
+  const requests = [];
+  let subscriber;
+  let counter = 0;
+  const injectedRuntime = {
+    subscribe(listener) { subscriber = listener; listener({ phase }); },
+    embedTask: async snapshot => {
+      taskCalls.push(copy(snapshot));
+      return embedTask ? embedTask(copy(snapshot)) : embeddingResult(snapshot);
+    },
+    embedQuery: async query => {
+      queryCalls.push(query);
+      return embedQuery ? embedQuery(query) : embeddingResult({});
+    },
+  };
+  const fetch = async (url, options = {}) => {
+    const method = options.method ?? 'GET';
+    const body = options.body ? JSON.parse(options.body) : null;
+    requests.push({ url, method, body });
+    if (onFetch) {
+      const custom = await onFetch({ url, method, body, tasks, embedded, uploads });
+      if (custom) return custom;
+    }
+    if (url === '/api/todos/embeddings/pending') {
+      return apiResponse([...tasks.values()].filter(item => !embedded.has(item.id)));
+    }
+    if (url === '/api/todos/search') {
+      return apiResponse({ matches: [...tasks.values()].filter(item => embedded.has(item.id))
+        .reverse().map(todo => ({ todo, score: 1 })), pending_count: tasks.size - embedded.size });
+    }
+    if (url === '/api/todos') {
+      if (method === 'GET') return apiResponse([...tasks.values()]);
+      const task = { id: `added-${++counter}`, ...body, completed: false };
+      tasks.set(task.id, task);
+      return apiResponse(task, 201);
+    }
+    const [, id, suffix] = url.match(/^\/api\/todos\/([^/]+)(\/embedding)?$/);
+    const task = tasks.get(id);
+    if (suffix) {
+      uploads.push({ id, body });
+      if (!task) return apiResponse({ detail: 'Missing' }, 404);
+      if (task.title !== body.title || task.icon !== body.icon) return apiResponse({ detail: 'Changed' }, 409);
+      embedded.add(id);
+      return apiResponse(null, 204);
+    }
+    if (method === 'DELETE') { tasks.delete(id); embedded.delete(id); return apiResponse(null, 204); }
+    if (!task) return apiResponse({ detail: 'Missing' }, 404);
+    if (method === 'PUT') embedded.delete(id);
+    const updated = { ...task, ...body };
+    tasks.set(id, updated);
+    return apiResponse(updated);
+  };
+  const source = readFileSync(new URL('../app/static/app.js', import.meta.url), 'utf8')
+    .replace("import('/static/model-runtime.mjs')", 'Promise.resolve({ modelRuntime: injectedRuntime })');
+  const context = { document, navigator: { maxTouchPoints: 0 }, injectedRuntime, fetch, setTimeout, clearTimeout };
+  runInNewContext(`${source}\n globalThis.appTest = { rows, embeddingJobs, requestBackfill };`, context);
+  return {
+    element: selector => document.querySelector(selector), document, rows: context.appTest.rows,
+    jobs: context.appTest.embeddingJobs, requestBackfill: context.appTest.requestBackfill,
+    tasks, embedded, uploads, taskCalls, queryCalls, requests,
+    ready: () => { phase = 'ready'; subscriber({ phase }); },
+  };
+}
+
+const savedTask = (id, title = id) => ({ id, title, icon: 'task', completed: false });
+
+test('backfill embeds server snapshots on readiness including additions during loading, skipping current vectors', async () => {
+  const fixture = appFixture({ items: [savedTask('old', 'Saved title'), savedTask('current')], current: ['current'] });
+  await until(() => fixture.rows.size === 2);
+  const old = fixture.rows.get('old');
+  await old.title.emit('click');
+  old.editor.value = 'Unsaved draft';
+  await old.editor.emit('input');
+  fixture.element('#todo-title').value = 'Added while loading';
+  await fixture.element('#todo-form').emit('submit');
+  assert.equal(fixture.taskCalls.length, 0);
+  fixture.ready();
+  await until(() => fixture.uploads.length === 2);
+  assert.deepEqual(fixture.taskCalls, [
+    { title: 'Saved title', icon: 'task' }, { title: 'Added while loading', icon: 'task' },
+  ]);
+  assert.equal(old.editor.value, 'Unsaved draft');
+  assert.equal(old.editing, true);
+  assert.equal(fixture.document.activeElement, old.editor);
+  assert.deepEqual(fixture.uploads.map(upload => upload.id), ['old', 'added-1']);
+});
+
+test('backfill deduplicates Refresh jobs and submits incrementally so searches can interleave', async () => {
+  const gate = deferred();
+  const fixture = appFixture({ items: [savedTask('one'), savedTask('two')],
+    embedTask: async snapshot => { if (snapshot.title === 'one') await gate.promise; return embeddingResult(snapshot); } });
+  await until(() => fixture.rows.size === 2);
+  fixture.ready();
+  await until(() => fixture.taskCalls.length === 1);
+  await fixture.element('#refresh-button').emit('click');
+  await fixture.requestBackfill();
+  assert.equal(fixture.taskCalls.length, 1, 'Only the active background job is submitted');
+  fixture.element('#todo-search').value = 'one';
+  await fixture.element('#todo-search').emit('input');
+  await until(() => fixture.queryCalls.length === 1);
+  assert.match(fixture.element('#search-status').textContent, /2 tasks still being indexed/);
+  gate.resolve();
+  await until(() => fixture.uploads.length === 2);
+  await fixture.element('#refresh-button').emit('click');
+  await until(() => fixture.jobs.size === 0);
+  assert.deepEqual(fixture.taskCalls.map(call => call.title), ['one', 'two']);
+});
+
+test('backfill upload retries reuse computed vectors and do not recreate tasks', async () => {
+  for (const retry of ['row', 'refresh']) {
+    let attempts = 0;
+    const fixture = appFixture({ items: [savedTask('one')], onFetch: ({ url }) => {
+      if (url.endsWith('/embedding') && ++attempts === 1) return apiResponse({ detail: 'Temporary upload failure' }, 503);
+    } });
+    await until(() => fixture.rows.size === 1);
+    fixture.ready();
+    await until(() => fixture.jobs.get('one')?.error);
+    const computed = copy(fixture.jobs.get('one').result);
+    assert.equal(fixture.taskCalls.length, 1);
+    if (retry === 'row') await fixture.rows.get('one').row.find('embedding-retry').emit('click');
+    else await fixture.element('#refresh-button').emit('click');
+    await until(() => fixture.jobs.size === 0);
+    assert.equal(attempts, 2);
+    assert.equal(fixture.taskCalls.length, 1);
+    assert.deepEqual(fixture.uploads[0].body, computed);
+    assert.equal(fixture.requests.filter(request => request.method === 'POST' && request.url === '/api/todos').length, 0);
+  }
+});
+
+test('backfill drops obsolete inference after source edits and deletion', async () => {
+  for (const action of ['edit', 'delete']) {
+    const gate = deferred();
+    const fixture = appFixture({ items: [savedTask('one', 'Original')],
+      embedTask: async snapshot => { if (snapshot.title === 'Original') await gate.promise; return embeddingResult(snapshot); } });
+    await until(() => fixture.rows.size === 1);
+    fixture.ready();
+    await until(() => fixture.taskCalls.length === 1);
+    const row = fixture.rows.get('one');
+    if (action === 'edit') {
+      await row.title.emit('click');
+      row.editor.value = 'Confirmed edit';
+      await row.editor.emit('input');
+      await row.editor.emit('keydown', { key: 'Enter' });
+      await until(() => row.item.title === 'Confirmed edit');
+    } else {
+      await row.remove.emit('click');
+      await until(() => fixture.rows.size === 0);
+    }
+    gate.resolve();
+    await until(() => fixture.jobs.size === 0);
+    assert.equal(fixture.uploads.some(upload => upload.body.title === 'Original'), false);
+    if (action === 'edit') {
+      assert.deepEqual(fixture.taskCalls.map(call => call.title), ['Original', 'Confirmed edit']);
+      assert.equal(fixture.uploads[0].body.title, 'Confirmed edit');
+    } else assert.equal(fixture.uploads.length, 0);
+  }
+});
+
+test('backfill reconciles source conflicts and discards deleted server snapshots', async () => {
+  for (const action of ['edit', 'delete']) {
+    let once = false;
+    const fixture = appFixture({ items: [savedTask('one', 'Original')], onFetch: ({ url, tasks }) => {
+      if (url.endsWith('/embedding') && !once) {
+        once = true;
+        if (action === 'edit') tasks.set('one', savedTask('one', 'Changed in another tab'));
+        else tasks.delete('one');
+      }
+    } });
+    await until(() => fixture.rows.size === 1);
+    fixture.ready();
+    await until(() => once && fixture.jobs.size === 0);
+    if (action === 'edit') {
+      await until(() => fixture.uploads.length === 2);
+      assert.deepEqual(fixture.taskCalls.map(call => call.title), ['Original', 'Changed in another tab']);
+      assert.equal(fixture.rows.get('one').item.title, 'Changed in another tab');
+    } else {
+      await until(() => fixture.rows.size === 0);
+      assert.equal(fixture.uploads.length, 1);
+      assert.equal(fixture.taskCalls.length, 1);
+    }
+  }
+});
+
+test('backfill ignores a delayed pending response captured before a successful upload', async () => {
+  const inference = deferred();
+  const scan = deferred();
+  let holdScan = false;
+  const fixture = appFixture({ items: [savedTask('one')],
+    embedTask: async snapshot => { await inference.promise; return embeddingResult(snapshot); },
+    onFetch: async ({ url, tasks }) => {
+      if (url.endsWith('/pending') && holdScan) {
+        holdScan = false;
+        const stale = [...tasks.values()];
+        await scan.promise;
+        return apiResponse(stale);
+      }
+    },
+  });
+  await until(() => fixture.rows.size === 1);
+  fixture.ready();
+  await until(() => fixture.taskCalls.length === 1);
+  holdScan = true;
+  const refreshing = fixture.requestBackfill();
+  inference.resolve();
+  await until(() => fixture.uploads.length === 1);
+  scan.resolve();
+  await refreshing;
+  assert.equal(fixture.taskCalls.length, 1);
+  assert.equal(fixture.jobs.size, 0);
+});
+
+test('search ignores obsolete results, preserves drafts and focus, and clearing restores normal order', async () => {
+  const oldSearch = deferred();
+  let searches = 0;
+  const fixture = appFixture({ items: [savedTask('one'), savedTask('two'), savedTask('three')],
+    current: ['one', 'two', 'three'], onFetch: async ({ url, tasks }) => {
+      if (url === '/api/todos/search') {
+        if (++searches === 1) { await oldSearch.promise; return apiResponse({ matches: [{ todo: tasks.get('one'), score: 1 }], pending_count: 0 }); }
+        return apiResponse({ matches: [{ todo: tasks.get('three'), score: 1 }, { todo: tasks.get('two'), score: 0.5 }], pending_count: 0 });
+      }
+    },
+  });
+  await until(() => fixture.rows.size === 3);
+  fixture.ready();
+  const row = fixture.rows.get('one');
+  await row.title.emit('click');
+  row.editor.value = 'Unsaved draft';
+  row.editor.setSelectionRange(2, 5);
+  await row.editor.emit('input');
+  const input = fixture.element('#todo-search');
+  input.value = 'old query';
+  await input.emit('input');
+  await until(() => searches === 1);
+  input.value = 'new query';
+  await input.emit('input');
+  await until(() => searches === 2);
+  await until(() => fixture.element('#search-status').textContent === '2 results');
+  oldSearch.resolve();
+  await delay(10);
+  assert.equal(fixture.element('#search-status').textContent, '2 results');
+  assert.equal(row.row.hidden, false, 'A draft remains visible even when it does not match');
+  assert.equal(row.editor.value, 'Unsaved draft');
+  assert.equal(fixture.document.activeElement, row.editor);
+  assert.deepEqual([row.editor.selectionStart, row.editor.selectionEnd], [2, 5]);
+  assert.deepEqual(fixture.element('#todo-list').children.map(element => element.dataset.id), ['three', 'two', 'one']);
+  assert.equal(fixture.requests.some(request => request.method === 'PUT' && request.url === '/api/todos/one'), false,
+    'Result reordering must not submit the focused draft');
+  await fixture.element('#search-clear').emit('click');
+  assert.equal(fixture.requests.some(request => request.method === 'PUT' && request.url === '/api/todos/one'), false,
+    'Restoring list order must not submit the focused draft');
+  assert.equal(row.editor.value, 'Unsaved draft');
+  assert.deepEqual(fixture.element('#todo-list').children.map(element => element.dataset.id), ['one', 'two', 'three']);
+  assert.equal(fixture.element('#search-status').hidden, true);
+  assert.equal(fixture.document.activeElement, input);
 });
 
 // Opt-in real inference using authentic downloads in .venv/model-assets.

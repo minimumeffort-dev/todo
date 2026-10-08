@@ -59,43 +59,48 @@ edited. Failed requests display an error and preserve your input or existing tas
 Saved titles, icons, and completion states remain after reloading or restarting.
 Stop the server with Ctrl+C.
 
-## Run EmbeddingGemma 2
+## Model loading and search
 
-Choose **Load and test model** beside **Refresh** in the task toolbar. This loads the
-model on demand in a module worker and runs a built-in sample sentence on
-WebGPU. **Model ready** means inference succeeded with finite, nonzero output.
-The sample output is validated and discarded. Loading remains optional.
+EmbeddingGemma 2 loads automatically when the page opens. A compact indicator
+above the task card animates during setup and download; **Model ready** means a
+built-in sample produced valid output on WebGPU. Task controls remain usable
+while the model loads or if loading fails. Failure details and **Retry** appear
+in the indicator. Retry starts a fresh worker after a failure or timeout.
 
-When the model is ready, each newly saved task—including the first task—gets
-one embedding from its confirmed title and icon. Processing runs in the
-background; the composer stays ready for another task. A small **Processing…**
-status appears on the task until its vector is saved. Tasks added before the
-model is ready stay saved without an embedding; loading does not process old tasks.
+Use **Search tasks** to find saved tasks by meaning, including completed tasks.
+For example, “purchase food” can find a grocery task. Queries accept 1–500
+characters and wait for model readiness. Results rank by cosine similarity to
+the query vector and show up to 20 tasks. The status reports when some tasks
+still lack embeddings, so an incomplete index is distinguishable from an empty
+one. Results update as indexing finishes. **Clear search**, or Escape in the
+search field, restores normal list order. Search updates preserve row drafts,
+retry controls, and keyboard focus.
 
-If inference or saving its vector fails, the task stays saved and gets a separate
-**Retry** for processing. This never adds the task again. A failed vector upload
-reuses its computed vector; an inference retry runs the model again. Task-save
-errors and their retries remain separate. After a worker crash or timeout, load
-the model again using the toolbar's **Retry**, then retry processing on the task.
-Results for changed or deleted tasks are discarded. Completion changes preserve
-embeddings; changing a saved title or icon clears them. Edits do not automatically
-start another embedding.
+When the model becomes ready, the app fetches saved tasks with missing or
+incompatible embeddings and processes them in the background. This includes
+older tasks and tasks added during loading. **Refresh**, successful additions,
+and saved title or icon edits also check for missing embeddings. One background
+inference is submitted at a time so searches can interleave. Completion changes
+preserve embeddings; source edits invalidate them and trigger new processing.
 
-Inference stays in the browser. Only saved task values go to the model worker;
-unsaved drafts are not used. The combined text is exactly
-`Icon: <icon>\nTask: <title>` (input version 1), using the icon's text key, such as
-`shopping`. The resulting 768-value vector and its source metadata go only to
-the local FastAPI app. There are no task hints, generated text, or search yet.
+If inference or a vector upload fails, the task stays saved and gets a separate
+processing **Retry**. Retrying never creates another task. A failed upload reuses
+its computed vector; an inference retry computes a new one. **Refresh** also
+retries pending indexing. Changed or deleted snapshots are discarded, and
+conflicts from another tab are reconciled with the current saved source.
 
-The model panel shows indeterminate progress during setup and a percentage
-when the download total is available. **Retry** starts a fresh worker after a
-loading failure or worker timeout. Tasks remain usable during model loading,
-testing, and errors.
+Inference stays in a browser module worker. Task embeddings use confirmed saved
+values, never unsaved drafts. Their input is exactly
+`Icon: <icon>\nTask: <title>` (input version 1), with the icon's text key such as
+`shopping`. Search embeds the trimmed query text with the same resident model.
+The resulting 768-value vectors and metadata go to the local FastAPI app for
+storage or ranking; inference does not send task or query text to a remote model
+service.
 
-Use a current WebGPU-capable browser with WebGPU available in module workers,
-hardware acceleration, and enough GPU memory. Serve the app on **HTTPS or
-localhost**. The panel explains when WebGPU or a GPU adapter is unavailable.
-The test uses the WebGPU backend; support depends on the browser, OS, and GPU.
+Use a current WebGPU-capable browser with WebGPU in module workers, hardware
+acceleration, and enough GPU memory. Serve the app on **HTTPS or localhost**.
+If WebGPU is unavailable, ordinary task controls still work and the model panel
+explains why semantic search is unavailable.
 
 The verified pins are:
 
@@ -107,20 +112,19 @@ The verified pins are:
 | Transformers.js | `4.3.1` |
 | ONNX Runtime Web dependency | `1.31.0-dev.20260914-8d85527a0` |
 
-The model loads the text encoder and tokenizer. Vision and audio
-encoder configs are disabled. All model and tokenizer requests, including
-metadata probes, use the pinned revision.
+The model loads only the text encoder and tokenizer. Model and tokenizer
+requests, including metadata probes, use the pinned revision.
 
-The first activation fetches approximately **234 MB of uncompressed assets**:
+The first page load fetches approximately **234 MB of uncompressed assets**:
 about 175 MB of model graph/weights, 32 MB of tokenizer data, and 27 MB of runtime
 files. Network transfer varies with compression and caching. Downloads use
-`huggingface.co`, its weight CDN `us.aws.cdn.hf.co`, and `cdn.jsdelivr.net`.
-Network access starts only after activation.
+`huggingface.co`, its CDN `us.aws.cdn.hf.co`, and `cdn.jsdelivr.net`.
+Network access starts automatically during page initialization.
 
-Model assets use the browser's origin-scoped cache when available. Reloading
-releases the resident worker and returns the panel to its initial state;
-activation can reuse cached assets. Browser storage quotas, private browsing,
-cache eviction, or clearing site data may require another download.
+Assets use the browser's origin-scoped cache when available. Reloading releases
+the resident worker and automatically loads again, reusing cached assets and
+current saved task vectors. Browser storage quotas, private browsing, cache
+eviction, or clearing site data may require another download.
 
 ## Storage
 
@@ -144,88 +148,67 @@ TODO_DB_PATH=/absolute/path/to/todos.duckdb .venv/bin/python -m uvicorn app.main
 
 ## Verify
 
-```sh
-.venv/bin/python -m pip install 'setuptools>=68' wheel
-.venv/bin/python -m pytest -q -p no:cacheprovider
-mise exec node@22.20.0 -- node --test tests/model_runtime.test.mjs
-```
-
-The API tests use temporary databases and cover adding, listing, editing,
-deleting, completing and reopening, invalid input, supported icons, missing
-items, legacy database upgrades, repeated completion requests, persistence
-across application restarts, embedding migration and persistence, vector and
-metadata validation, stale uploads, edit invalidation, completion preservation,
-and health checks without database access.
-Model asset checks also verify JavaScript serving, the panel's separate status
-elements, wheel packaging, and the offline worker lifecycle suite. These checks
-need Node 22. Install it with `mise install node@22.20.0` if needed. Browser
-integration checks are opt-in.
-
-To prepare reproducible browser checks, install Playwright and download the
-pinned fixtures (approximately 234 MB, stored under the ignored `.venv` folder):
+Use Python 3.12 and Node 22 for the verified test setup:
 
 ```sh
-mise install node@22.20.0
-mise exec node@22.20.0 -- npm install --prefix .venv/model-browser --no-audit --no-fund playwright@1.55.1
-mise exec node@22.20.0 -- node .venv/model-browser/node_modules/playwright/cli.js install chromium
-mise exec node@22.20.0 -- .venv/bin/python tests/test_model_assets.py --download-fixtures
+.venv/bin/python -m pip install -e '.[test]' 'setuptools>=68' wheel
+mise install node@22
+.venv/bin/python tests/test_model_assets.py --check-suites
 ```
 
-Playwright reports any missing native Chromium libraries on Linux. The fixture
-preparation command verifies SHA-256 hashes before making downloads available
-to tests and reuses matching files on later runs.
+The full Python suite uses temporary databases and includes both offline Node
+suites. It covers task lifecycle and persistence, legacy database upgrades,
+embedding validation and atomic uploads, pending eligibility, cosine ranking
+and stable ties, and query/task inference serialization, failures, timeouts,
+and disposal. Static checks verify JavaScript serving and wheel packaging;
+panel tests verify automatic startup and accessible state changes.
+Set `MODEL_TEST_NODE` to an absolute Node executable path if it is outside PATH
+and the usual mise installation directory.
 
-Run these checks separately; each starts and stops its own FastAPI server and
-browser using temporary databases and dynamically allocated loopback ports:
+Install the optional browser setup and prepare the pinned fixtures:
 
 ```sh
-MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k real_model -q
-MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k failures_retry -q
-MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k external_weight -q
-MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k task_flows -q
-MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k real_task_embeddings -q
-MODEL_BROWSER_CHECK=1 mise exec node@22.20.0 -- .venv/bin/python -m pytest tests/test_model_assets.py -k embedding_creation -q
-.venv/bin/python tests/test_model_assets.py --check-regressions
+mise exec node@22 -- npm install --prefix .venv/model-browser --no-audit --no-fund playwright@1.55.1
+mise exec node@22 -- node .venv/model-browser/node_modules/playwright/cli.js install chromium
+.venv/bin/python tests/test_model_assets.py --download-fixtures
 ```
 
-The first two run the actual model in the production worker with authentic
-cached bytes. The tests raise the temporary browser cache quota to fit the
-fixtures and use Chromium's SwiftShader software WebGPU adapter in the Linux VM.
-They verify task interactions during loading and inference, draft preservation,
-blocked runtime/model-graph/external-weight downloads, unsupported WebGPU,
-retry, and cache reuse after reload. Fault tests reject downloads through browser
-routing and the SDK's fetch hook; they do not replace inference or its output.
-The third specifically checks that a failed external-weight download offers
-**Retry**, then verifies real inference succeeds after retry. The fourth checks
-task add/edit/complete/reopen/remove flows, completion failure/retry, and a
-narrow layout alongside the model panel.
-The fifth creates the first and consecutive tasks with the real model, verifies
-that both title and icon affect their vectors, and inspects DuckDB after a restart.
-The sixth uses an injected runtime with the real API for deterministic inference
-and upload failures, separate retries, completion during processing, and local
-and remote edit/delete races. It also checks that background processing keeps
-drafts and keyboard focus intact.
-The final command runs the Python and offline Node suites alongside the cached
-loading/retry and task-flow browser checks. It runs only one real-model scenario
-at a time to limit CPU contention on the software WebGPU adapter.
+Playwright reports missing native Chromium libraries on Linux. Fixture downloads
+are approximately 234 MB under the ignored `.venv/model-assets` directory and
+are verified against SHA-256 hashes; matching files are reused on later runs.
 
-For a cold download check, set `MODEL_COLD_DOWNLOAD=1` on the `real_model` command;
-this uses the actual CDN requests and can take several minutes. In the managed
-VM, the check uses the provided network proxy for HTTPS and bypasses it for
-localhost. The cold run and cached inference checks were verified with
-Chromium 140 on the software WebGPU adapter. Physical GPU and browser performance
-will vary.
+Run each browser check separately:
 
-For a browser check, start the app, add consecutive tasks, edit one by mouse
-and one by keyboard, and verify Enter/blur saving and Escape cancellation.
-Change an icon, reload to confirm persistence, then remove tasks and check
-where keyboard focus lands. Check a task, reload, restart the server, and confirm
-that it is still checked, visible, and in the same position. Uncheck it and reload
-again. Also check request failures and delays, refresh during an edit, and a
-narrow touch layout. Automated Chromium checks verified completion with the
-real API in the Linux VM, including server restarts, draft preservation, icon
-changes, failed-request retries, editing other rows during pending requests,
-and completed-task removal.
+```sh
+.venv/bin/python tests/test_model_assets.py --check-flows
+.venv/bin/python tests/test_model_assets.py --check-real
+```
+
+Each command starts and stops its own FastAPI server and Chromium in the same
+process, with temporary databases and dynamically allocated loopback ports.
+The flow check injects model inference while exercising the real DOM, API, and
+DuckDB: additions during loading, saved-snapshot backfill, current-vector reuse,
+source edits/deletions during inference, 404/409 reconciliation, inference and
+upload retries, rapid searches, clearing, and draft/focus preservation.
+Browser actions await matching responses registered before the action and then
+assert the rendered state. Controlled request gates cover pending creation and
+saves; held search responses arrive after a newer query, clearing, or a source
+save to verify that obsolete results cannot overwrite the current view.
+
+The real-model check uses the deployed worker and authentic pinned bytes in
+Chromium's browser cache. It verifies automatic activation, loading failure and
+retry, missing-item backfill, semantic ranking, cache reuse after reload, and
+persisted vectors after a server restart. Both browser checks include a narrow
+layout and reduced motion. Chromium uses SwiftShader software WebGPU in the
+Linux VM; physical GPU and browser performance varies. The real check also
+verifies that unsupported WebGPU leaves task controls available.
+On reload, reaching the sample-test phase confirms that the fresh worker loaded
+the cached tokenizer and weights. The check then stops Chromium before waiting
+for a second software-GPU sample; the first sample and real inference already
+passed.
+
+Browser tests are opt-in under ordinary pytest runs. Set `MODEL_BROWSER_CHECK=1`
+to include them, or use the two commands above.
 
 The API is available at `GET /api/todos`, `POST /api/todos` (JSON body
 `{"title": "Buy groceries", "icon": "shopping"}`), `PUT /api/todos/{id}`
@@ -250,3 +233,16 @@ incompatible metadata or an invalid vector returns 422, a missing task returns
 404, and a changed title/icon snapshot returns 409. Source comparison and the
 vector write are atomic.
 Ordinary task responses still contain only `id`, `title`, `icon`, and `completed`.
+
+`GET /api/todos/embeddings/pending` returns ordinary task objects in list order
+for missing or incompatible embeddings. Compatibility requires the current
+model, revision, input version, dimensions, and a usable finite nonzero vector.
+
+`POST /api/todos/search` accepts
+`{vector, model, revision, input_version, dimensions, limit?}` with the same
+vector validation as uploads. `limit` defaults to 20 and must be an integer from
+1 to 100. The response is `{matches: [{todo, score}], pending_count}`. Only
+compatible vectors are ranked by descending cosine similarity, with ties in
+creation-time/ID order; `pending_count` reports tasks still missing compatible
+vectors. Invalid input returns a sanitized 422 response. An empty index returns
+an empty `matches` list.

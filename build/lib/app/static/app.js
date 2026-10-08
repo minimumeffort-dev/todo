@@ -8,9 +8,6 @@ const list = document.querySelector('#todo-list');
 const count = document.querySelector('#count');
 const status = document.querySelector('#status');
 const error = document.querySelector('#error');
-const searchInput = document.querySelector('#todo-search');
-const searchClear = document.querySelector('#search-clear');
-const searchStatus = document.querySelector('#search-status');
 // Keep controls available on touch devices even when a keyboard or mouse is used.
 document.documentElement.classList.toggle('touch-device', navigator.maxTouchPoints > 0);
 const icons = {
@@ -27,32 +24,11 @@ let openPicker = null;
 let pickerSequence = 0;
 let modelReady = false;
 let modelRuntime = null;
-let modelPhase = 'idle';
-let sourceEpoch = 0;
-let normalOrder = [];
-const embeddingJobs = new Map();
-let backfillRequested = false;
-let scanningBackfill = false;
-let pumpingBackfill = false;
-let searchSequence = 0;
-let searchTimer = null;
-let searchMatches = null;
-let queryEmbedding = null;
-let arrangingRows = false;
-// The page-level model panel owns activation; share its resident runtime.
+// Share the toolbar's runtime. Importing it never activates model downloads.
 import('/static/model-runtime.mjs').then(module => {
   modelRuntime = module.modelRuntime;
-  modelRuntime.subscribe(snapshot => {
-    const wasReady = modelReady;
-    modelPhase = snapshot.phase;
-    modelReady = snapshot.phase === 'ready';
-    if (modelReady && !wasReady) requestBackfill();
-    scheduleSearch(0);
-  });
-}).catch(() => {
-  modelPhase = 'error';
-  scheduleSearch(0);
-});
+  modelRuntime.subscribe(snapshot => { modelReady = snapshot.phase === 'ready'; });
+}).catch(() => { /* Optional model setup must not prevent ordinary task entry. */ });
 
 function button(className, label) {
   const element = document.createElement('button');
@@ -90,187 +66,45 @@ function updateCount() {
 function sameSource(first, second) {
   return first.title === second.title && first.icon === second.icon;
 }
-function embeddingIsCurrent(job) {
-  return embeddingJobs.get(job.id) === job;
-}
-function renderJob(job) {
-  const state = rows.get(job.id);
-  if (state) {
-    state.embedding = embeddingJobs.get(job.id) ?? null;
-    state.renderEmbedding();
-  }
+function embeddingIsCurrent(state, job) {
+  return rows.get(state.item.id) === state && state.embedding === job
+    && sameSource(state.item, job.snapshot);
 }
 function invalidateEmbedding(state, confirmed) {
-  const job = embeddingJobs.get(state.item.id);
-  if (job && (!confirmed || !sameSource(job.snapshot, confirmed))) {
-    embeddingJobs.delete(job.id);
+  if (state.embedding && (!confirmed || !sameSource(state.embedding.snapshot, confirmed))) {
     state.embedding = null;
     state.renderEmbedding();
   }
 }
-async function processTask(job) {
-  if (!embeddingIsCurrent(job) || job.pending) return;
+async function processTask(state, job = state.embedding) {
+  if (!job || !embeddingIsCurrent(state, job) || job.pending) return;
   job.pending = true;
   job.error = false;
-  renderJob(job);
+  state.renderEmbedding();
   try {
     // A persistence retry reuses the successful vector; it never recreates the task.
     if (!job.result) job.result = await modelRuntime.embedTask(job.snapshot);
-    if (!embeddingIsCurrent(job)) return;
-    await request(`/api/todos/${encodeURIComponent(job.id)}/embedding`, {
+    if (!embeddingIsCurrent(state, job)) return;
+    await request(`/api/todos/${encodeURIComponent(state.item.id)}/embedding`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job.result),
     });
-    if (embeddingIsCurrent(job)) {
-      ++sourceEpoch;
-      embeddingJobs.delete(job.id);
-      scheduleSearch();
-    }
+    if (embeddingIsCurrent(state, job)) state.embedding = null;
   } catch (exception) {
-    if (!embeddingIsCurrent(job)) return;
+    if (!embeddingIsCurrent(state, job)) return;
     // A source changed in another tab or a deletion is final for this snapshot.
     if (exception.status === 404 || exception.status === 409 || exception.name === 'AbortError') {
-      embeddingJobs.delete(job.id);
-      if (exception.status === 404 || exception.status === 409) {
-        void loadItems();
-        requestBackfill();
-      }
+      state.embedding = null;
     } else job.error = true;
   } finally {
     job.pending = false;
-    renderJob(job);
+    state.renderEmbedding();
   }
 }
-async function pumpBackfill() {
-  if (pumpingBackfill || !modelReady) return;
-  pumpingBackfill = true;
-  try {
-    // Submit one background inference at a time, allowing query requests to
-    // interleave instead of filling the worker's queue with the entire list.
-    while (modelReady) {
-      const job = [...embeddingJobs.values()].find(candidate => !candidate.pending && !candidate.error);
-      if (!job) break;
-      await processTask(job);
-    }
-  } finally { pumpingBackfill = false; }
-}
-async function requestBackfill() {
+function embedCreatedTask(state) {
   if (!modelReady || !modelRuntime) return;
-  backfillRequested = true;
-  if (scanningBackfill) return;
-  scanningBackfill = true;
-  try {
-    while (backfillRequested && modelReady) {
-      backfillRequested = false;
-      const epoch = sourceEpoch;
-      const pending = await request('/api/todos/embeddings/pending');
-      if (epoch !== sourceEpoch) { backfillRequested = true; continue; }
-      const byId = new Map(pending.map(item => [item.id, item]));
-      for (const [id, job] of embeddingJobs) {
-        if (!byId.has(id) || !sameSource(job.snapshot, byId.get(id))) {
-          embeddingJobs.delete(id);
-          renderJob(job);
-        }
-      }
-      for (const item of pending) {
-        let job = embeddingJobs.get(item.id);
-        if (!job) {
-          job = { id: item.id, snapshot: { title: item.title, icon: item.icon },
-            result: null, pending: false, error: false };
-          embeddingJobs.set(item.id, job);
-        } else job.error = false;
-        renderJob(job);
-      }
-      void pumpBackfill();
-    }
-  } catch {
-    if (searchInput?.value.trim()) setSearchStatus('Could not check search indexing. Try Refresh.');
-  } finally { scanningBackfill = false; }
-}
-
-function setSearchStatus(message = '') {
-  if (!searchStatus) return;
-  searchStatus.textContent = message;
-  searchStatus.hidden = !message;
-}
-function applySearchView() {
-  const active = Boolean(searchInput?.value.trim()) && searchMatches !== null;
-  const matches = new Set(searchMatches ?? []);
-  const pinned = state => state.editing || state.pending || state.hasError || state.embedding?.error
-    || !sameSource(state.draft, state.item) || state.row.contains(document.activeElement);
-  for (const [id, state] of rows) state.row.hidden = active && !matches.has(id) && !pinned(state);
-  const order = active ? [...searchMatches, ...normalOrder.filter(id => !matches.has(id))] : normalOrder;
-  const focused = document.activeElement;
-  const selection = focused?.classList?.contains('task-editor')
-    ? [focused.selectionStart, focused.selectionEnd] : null;
-  // Moving a focused row can dispatch focusout. Keep that internal DOM move
-  // from submitting its draft, and restore the editor's selection afterwards.
-  arrangingRows = true;
-  try {
-    let previous = null;
-    for (const id of order) {
-      const row = rows.get(id)?.row;
-      if (!row) continue;
-      const expected = previous ? previous.nextElementSibling : list.firstElementChild;
-      if (row !== expected) list.insertBefore(row, expected);
-      previous = row;
-    }
-    if (focused && document.activeElement !== focused && list.contains(focused)) {
-      focused.focus();
-      if (selection) focused.setSelectionRange(...selection);
-    }
-  } finally { arrangingRows = false; }
-}
-function scheduleSearch(delay = 250) {
-  const sequence = ++searchSequence;
-  clearTimeout(searchTimer);
-  const query = searchInput?.value.trim() ?? '';
-  if (searchClear) searchClear.hidden = !searchInput.value;
-  if (!query) {
-    searchMatches = null;
-    queryEmbedding = null;
-    setSearchStatus();
-    applySearchView();
-    return;
-  }
-  if ([...query].length > 500) { setSearchStatus('Use a search query with 1–500 characters.'); return; }
-  if (!modelReady) {
-    setSearchStatus(['error', 'unsupported'].includes(modelPhase)
-      ? 'Search unavailable. Retry the model.' : 'Waiting for the model…');
-    return;
-  }
-  setSearchStatus('Searching…');
-  searchTimer = setTimeout(() => { void runSearch(query, sequence); }, delay);
-}
-async function runSearch(query, sequence) {
-  try {
-    let result = queryEmbedding?.query === query ? queryEmbedding.result : null;
-    if (!result) result = await modelRuntime.embedQuery(query);
-    if (sequence !== searchSequence) return;
-    queryEmbedding = { query, result };
-    const response = await request('/api/todos/search', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result),
-    });
-    if (sequence !== searchSequence) return;
-    searchMatches = response.matches.map(match => match.todo.id).filter(id => rows.has(id));
-    applySearchView();
-    setSearchStatus(response.pending_count > 0
-      ? `${searchMatches.length} results · ${response.pending_count} tasks still being indexed`
-      : searchMatches.length ? `${searchMatches.length} results` : 'No indexed tasks found.');
-  } catch (exception) {
-    if (sequence === searchSequence) setSearchStatus(exception.message);
-  }
-}
-function tasksChanging() {
-  ++sourceEpoch;
-  ++searchSequence;
-  clearTimeout(searchTimer);
-}
-function tasksChanged({ backfill = false } = {}) {
-  ++sourceEpoch;
-  searchMatches = null;
-  applySearchView();
-  scheduleSearch();
-  if (backfill) requestBackfill();
+  state.embedding = { snapshot: { title: state.item.title, icon: state.item.icon },
+    result: null, pending: false, error: false };
+  void processTask(state);
 }
 
 // A small, keyboard-accessible picker shared by rows and the composer.
@@ -406,10 +240,8 @@ function makeRow(item) {
   completion.setAttribute('aria-describedby', message.id);
   const state = { row, title, editor, completion, remove, item, draft: { title: item.title, icon: item.icon },
     editing: false, composing: false, pending: false, removingIntent: false,
-    failedAction: 'save', failedCompletion: null, embedding: embeddingJobs.get(item.id) ?? null,
-    hasError: false };
+    failedAction: 'save', failedCompletion: null, embedding: null };
   rows.set(item.id, state);
-  normalOrder.push(item.id);
   state.renderEmbedding = () => {
     const job = state.embedding;
     const retryFocused = document.activeElement === embeddingRetry;
@@ -423,14 +255,7 @@ function makeRow(item) {
       (state.editing ? editor : title).focus();
     }
   };
-  embeddingRetry.addEventListener('click', () => {
-    const job = embeddingJobs.get(item.id);
-    if (!job || job.pending) return;
-    job.error = false;
-    if (job.result) void processTask(job);
-    else if (modelReady) void pumpBackfill();
-    else { job.error = true; state.renderEmbedding(); }
-  });
+  embeddingRetry.addEventListener('click', () => { void processTask(state); });
   const icon = makeIconControl(iconContainer, item.icon, `Icon for ${item.title}`, value => {
     state.draft.icon = value;
     revision++;
@@ -454,7 +279,6 @@ function makeRow(item) {
     labels();
   };
   function rowError(text = '', action = 'save') {
-    state.hasError = Boolean(text);
     state.failedAction = action;
     message.textContent = text;
     feedback.hidden = !text;
@@ -508,7 +332,6 @@ function makeRow(item) {
     pending('save');
     icon.close();
     revision++;
-    tasksChanging();
     rowError();
     try {
       const updated = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
@@ -522,11 +345,9 @@ function makeRow(item) {
       const restoreFocus = document.activeElement === editor;
       pending(false);
       finishEditing(restoreFocus);
-      tasksChanged({ backfill: true });
     } catch (exception) { rowError(exception.message); }
     finally {
       pending(false);
-      scheduleSearch();
       if (document.activeElement === document.body && [icon.trigger, retry].includes(focusedControl)) {
         (focusedControl === retry && feedback.hidden ? title : focusedControl).focus();
       }
@@ -538,7 +359,6 @@ function makeRow(item) {
     pending('complete', desired);
     icon.close();
     revision++;
-    tasksChanging();
     rowError();
     completion.checked = desired;
     try {
@@ -550,13 +370,11 @@ function makeRow(item) {
       state.item = updated;
       // Completion changes the saved item without submitting or discarding drafts.
       labels();
-      tasksChanged();
     } catch (exception) {
       state.failedCompletion = desired;
       rowError(exception.message, 'complete');
     } finally {
       pending(false);
-      scheduleSearch();
       if (document.activeElement === document.body && [completion, retry].includes(focusedControl)) {
         (focusedControl === retry && feedback.hidden ? completion : focusedControl).focus();
       }
@@ -568,7 +386,6 @@ function makeRow(item) {
     pending('remove');
     icon.close();
     revision++;
-    tasksChanging();
     rowError();
     try {
       await request(`/api/todos/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
@@ -578,23 +395,18 @@ function makeRow(item) {
       const restoreFocus = hadFocus && (row.contains(document.activeElement) || document.activeElement === document.body);
       invalidateEmbedding(state, null);
       rows.delete(item.id);
-      normalOrder = normalOrder.filter(id => id !== item.id);
       row.remove();
       updateCount();
       if (restoreFocus) {
         if (adjacent) (adjacent.editing ? adjacent.editor : adjacent.title).focus();
         else openComposer();
       }
-      tasksChanged();
     } catch (exception) {
       rowError(exception.message, 'remove');
       pending(false);
       if (hadFocus && document.activeElement === document.body) remove.focus();
     }
-    finally {
-      state.removingIntent = false; state.removingHadFocus = false; pending(false);
-      scheduleSearch();
-    }
+    finally { state.removingIntent = false; state.removingHadFocus = false; pending(false); }
   }
   title.addEventListener('click', startEditing);
   completion.addEventListener('change', () => setCompleted(completion.checked));
@@ -615,7 +427,7 @@ function makeRow(item) {
   });
   row.addEventListener('focusout', event => {
     // Moving to this row's controls must not start a competing save.
-    if (arrangingRows || !state.editing || state.pending || state.removingIntent || row.contains(event.relatedTarget)
+    if (!state.editing || state.pending || state.removingIntent || row.contains(event.relatedTarget)
       || event.relatedTarget === refreshButton) return;
     save();
   });
@@ -635,7 +447,6 @@ function makeRow(item) {
     else save();
   });
   state.sync();
-  state.renderEmbedding();
   feedback.append(message, retry);
   embeddingFeedback.append(embeddingMessage, embeddingRetry);
   content.append(title, editor);
@@ -665,7 +476,7 @@ async function loadItems() {
       else {
         const updated = byId.get(id);
         invalidateEmbedding(state, updated);
-        if (preserveDraft) state.item = updated;
+        if (preserveDraft) state.item = { ...state.item, completed: updated.completed };
         else {
           state.item = updated;
           state.draft = { title: updated.title, icon: updated.icon };
@@ -674,14 +485,12 @@ async function loadItems() {
       }
     }
     for (const item of items) if (!rows.has(item.id)) makeRow(item);
-    normalOrder = [...items.map(item => item.id), ...normalOrder.filter(id => rows.has(id) && !byId.has(id))];
     updateCount();
-    tasksChanged();
   } catch (exception) {
     showError(exception.message);
     if (!rows.size) { status.textContent = 'Could not load your tasks. Try Refresh.'; status.hidden = false; }
   }
-  finally { loading = false; updateRefresh(); requestBackfill(); }
+  finally { loading = false; updateRefresh(); }
 }
 const composerPicker = makeIconControl(document.querySelector('#composer-icon'), 'task', 'New task icon', value => {
   composerIcon = value;
@@ -729,7 +538,6 @@ form.addEventListener('submit', async event => {
   }
   adding = true;
   revision++;
-  tasksChanging();
   input.readOnly = true;
   composerPicker.trigger.disabled = true;
   composerPicker.close();
@@ -745,7 +553,7 @@ form.addEventListener('submit', async event => {
       body: JSON.stringify({ title, icon: composerIcon }),
     });
     if (!rows.has(item.id)) makeRow(item);
-    tasksChanged({ backfill: true });
+    embedCreatedTask(rows.get(item.id));
     input.value = '';
     composerIcon = 'task';
     composerPicker.update('task');
@@ -759,27 +567,9 @@ form.addEventListener('submit', async event => {
     cancelAdd.disabled = false;
     form.setAttribute('aria-busy', 'false');
     updateRefresh();
-    scheduleSearch();
     // Keep consecutive entry convenient without stealing focus from another row.
     if (form.contains(document.activeElement) || document.activeElement === document.body) input.focus();
   }
 });
 refreshButton.addEventListener('click', loadItems);
-searchInput?.addEventListener('input', () => {
-  searchMatches = null;
-  applySearchView();
-  scheduleSearch();
-});
-searchClear?.addEventListener('click', () => {
-  searchInput.value = '';
-  scheduleSearch(0);
-  searchInput.focus();
-});
-searchInput?.addEventListener('keydown', event => {
-  if (event.key === 'Escape') {
-    event.preventDefault();
-    searchInput.value = '';
-    scheduleSearch(0);
-  }
-});
 loadItems();

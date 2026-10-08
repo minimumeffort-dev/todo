@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import math
 from threading import Lock
 from uuid import uuid4
 
@@ -80,53 +79,6 @@ class TodoStore:
                 [item["id"], item["title"], item["icon"]],
             )
         return item
-
-    def _embedding_rows(self):
-        return self._db().execute(
-            f"SELECT id, title, icon, completed, {', '.join(EMBEDDING_COLUMNS)} "
-            "FROM todos ORDER BY created_at, id"
-        ).fetchall()
-
-    @staticmethod
-    def _compatible(row, model, revision, input_version, dimensions):
-        vector = row[4]
-        return (
-            row[5:] == (model, revision, input_version, dimensions)
-            and vector is not None and len(vector) == dimensions
-            and all(value is not None and math.isfinite(value) for value in vector)
-            and any(vector)
-        )
-
-    @staticmethod
-    def _todo(row):
-        return {"id": row[0], "title": row[1], "icon": row[2], "completed": row[3]}
-
-    def pending_embeddings(self, model, revision, input_version, dimensions):
-        with self._lock:
-            rows = self._embedding_rows()
-        return [self._todo(row) for row in rows if not self._compatible(
-            row, model, revision, input_version, dimensions
-        )]
-
-    def search(self, *, vector, model, revision, input_version, dimensions, limit):
-        # Snapshot vectors and task fields under the same lock as writes. Compute
-        # cosine in float64 so float32 extremes cannot overflow or underflow.
-        with self._lock:
-            rows = self._embedding_rows()
-        matches = []
-        pending_count = 0
-        query_norm = math.sqrt(math.fsum(value * value for value in vector))
-        for row in rows:
-            if not self._compatible(row, model, revision, input_version, dimensions):
-                pending_count += 1
-                continue
-            stored = row[4]
-            norm = math.sqrt(math.fsum(value * value for value in stored))
-            score = math.fsum(a * b for a, b in zip(vector, stored)) / (query_norm * norm)
-            matches.append({"todo": self._todo(row), "score": max(-1.0, min(1.0, score))})
-        # Python's stable sort retains created_at/id order for equal scores.
-        matches.sort(key=lambda match: match["score"], reverse=True)
-        return {"matches": matches[:limit], "pending_count": pending_count}
 
     def update(self, item_id: str, title: str, icon: str) -> dict[str, str | bool] | None:
         # Compare against the old source in the same UPDATE. No-op saves and
