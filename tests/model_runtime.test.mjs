@@ -1270,6 +1270,177 @@ test('search ignores obsolete results, preserves drafts and focus, and clearing 
   assert.equal(fixture.document.activeElement, input);
 });
 
+test('search renders similarity scores with an explanation and keeps nonmatching drafts visible', async () => {
+  const fixture = appFixture({ items: [savedTask('one'), savedTask('two'), savedTask('three')],
+    current: ['one', 'two', 'three'], onFetch: async ({ url, tasks }) => {
+      if (url === '/api/todos/search') {
+        return apiResponse({ matches: [
+          { todo: tasks.get('three'), score: 0.72 },
+          { todo: tasks.get('two'), score: 0.5 },
+        ], pending_count: 0 });
+      }
+    },
+  });
+  await until(() => fixture.rows.size === 3);
+  fixture.ready();
+  const draft = fixture.rows.get('one');
+  await draft.title.emit('click');
+  draft.editor.value = 'Unsaved draft';
+  await draft.editor.emit('input');
+  const input = fixture.element('#todo-search');
+  input.value = 'groceries';
+  await input.emit('input');
+  await until(() => fixture.element('#search-status').textContent === '2 results');
+  assert.equal(fixture.rows.get('three').row.find('similarity').textContent, 'Similarity 0.72');
+  assert.equal(fixture.rows.get('three').row.find('similarity').hidden, false);
+  assert.equal(fixture.rows.get('two').row.find('similarity').textContent, 'Similarity 0.50');
+  assert.equal(fixture.rows.get('two').row.find('similarity').hidden, false);
+  assert.equal(draft.row.hidden, false, 'A draft remains visible even when it does not match');
+  assert.equal(draft.row.find('nonmatch').textContent, 'Not a search match');
+  assert.equal(draft.row.find('nonmatch').hidden, false);
+  assert.equal(draft.row.find('similarity').hidden, true, 'Nonmatches show no score');
+  assert.equal(fixture.element('#search-explain').hidden, false);
+  assert.deepEqual(fixture.element('#todo-list').children.map(element => element.dataset.id), ['three', 'two', 'one']);
+});
+
+test('search resyncs a source changed in another tab before scoring', async () => {
+  const fixture = appFixture({ items: [savedTask('one', 'Read a novel'), savedTask('two')],
+    current: ['one', 'two'], onFetch: async ({ url, tasks }) => {
+      if (url === '/api/todos/search') {
+        return apiResponse({ matches: [{ todo: tasks.get('one'), score: 0.94 }], pending_count: 0 });
+      }
+    },
+  });
+  await until(() => fixture.rows.size === 2);
+  fixture.ready();
+  // Another tab retitles the task; the local row still shows the stale source.
+  fixture.tasks.set('one', { ...savedTask('one'), title: 'Buy groceries' });
+  const draft = fixture.rows.get('two');
+  await draft.title.emit('click');
+  draft.editor.value = 'Unsaved draft';
+  draft.editor.setSelectionRange(1, 4);
+  await draft.editor.emit('input');
+  const input = fixture.element('#todo-search');
+  input.value = 'purchase food';
+  await input.emit('input');
+  await until(() => fixture.rows.get('one').item.title === 'Buy groceries');
+  await until(() => fixture.element('#search-status').textContent === '1 results');
+  assert.ok(fixture.requests.filter(request => request.url === '/api/todos/search').length >= 2,
+    'The stale response triggers a rerun once sources reconcile');
+  assert.equal(fixture.queryCalls.length, 1, 'The rerun reuses the cached query embedding');
+  assert.equal(fixture.rows.get('one').title.textContent, 'Buy groceries');
+  assert.equal(fixture.rows.get('one').row.find('similarity').textContent, 'Similarity 0.94',
+    'The score labels the current source, never the stale title');
+  assert.equal(draft.editor.value, 'Unsaved draft');
+  assert.equal(fixture.document.activeElement, draft.editor);
+  assert.deepEqual([draft.editor.selectionStart, draft.editor.selectionEnd], [1, 4]);
+});
+
+test('search retries a reconciliation refresh discarded by draft input', async () => {
+  let listRequests = 0;
+  const refreshGate = deferred();
+  const fixture = appFixture({ items: [savedTask('one', 'Read a novel'), savedTask('two')],
+    current: ['one', 'two'], onFetch: async ({ url, method, tasks }) => {
+      if (url === '/api/todos' && method === 'GET' && ++listRequests === 2) {
+        await refreshGate.promise; // Hold the automatic reconciliation refresh.
+      }
+      if (url === '/api/todos/search') {
+        return apiResponse({ matches: [{ todo: tasks.get('one'), score: 0.94 }], pending_count: 0 });
+      }
+    },
+  });
+  await until(() => fixture.rows.size === 2);
+  fixture.ready();
+  // Another tab retitles the task; the local row still shows the stale source.
+  fixture.tasks.set('one', { ...savedTask('one'), title: 'Buy groceries' });
+  const draft = fixture.rows.get('two');
+  await draft.title.emit('click');
+  const input = fixture.element('#todo-search');
+  input.value = 'purchase food';
+  await input.emit('input');
+  await until(() => listRequests === 2); // Reconciliation refresh is in flight.
+  // Draft input bumps revision, so the held refresh must discard on release.
+  draft.editor.value = 'Unsaved draft';
+  draft.editor.setSelectionRange(1, 4);
+  await draft.editor.emit('input');
+  refreshGate.resolve();
+  await until(() => fixture.rows.get('one').item.title === 'Buy groceries');
+  await until(() => fixture.element('#search-status').textContent === '1 results');
+  assert.ok(listRequests >= 3, 'The discarded refresh is retried while the query is current');
+  assert.ok(fixture.requests.filter(request => request.url === '/api/todos/search').length >= 2,
+    'The retried refresh reruns the search once sources reconcile');
+  assert.equal(fixture.rows.get('one').title.textContent, 'Buy groceries');
+  assert.equal(fixture.rows.get('one').row.find('similarity').textContent, 'Similarity 0.94',
+    'The score labels the current source, never the stale title');
+  assert.equal(fixture.requests.some(request => request.method === 'PUT' && request.url === '/api/todos/two'), false,
+    'Reconciliation never submits the focused draft');
+  assert.equal(draft.editor.value, 'Unsaved draft');
+  assert.equal(fixture.document.activeElement, draft.editor);
+  assert.deepEqual([draft.editor.selectionStart, draft.editor.selectionEnd], [1, 4]);
+});
+
+test('empty search results name no matches while indexing and errors stay distinct', async () => {
+  let mode = 'empty';
+  const fixture = appFixture({ items: [savedTask('one'), savedTask('two')],
+    current: ['one'], onFetch: async ({ url, tasks }) => {
+      if (url === '/api/todos/search') {
+        if (mode === 'error') return apiResponse({ detail: 'Search failed' }, 503);
+        if (mode === 'indexed') {
+          return apiResponse({ matches: [{ todo: tasks.get('one'), score: 0.9 }], pending_count: 1 });
+        }
+        return apiResponse({ matches: [], pending_count: 1 });
+      }
+    },
+  });
+  await until(() => fixture.rows.size === 2);
+  fixture.ready();
+  const input = fixture.element('#todo-search');
+  input.value = 'an unrelated query';
+  await input.emit('input');
+  await until(() => fixture.element('#search-status').textContent === 'No matching tasks · 1 tasks still being indexed');
+  assert.equal(fixture.element('#search-explain').hidden, true, 'No scores means no explanation');
+  assert.equal(fixture.rows.get('one').row.find('similarity').hidden, true);
+  mode = 'indexed';
+  input.value = 'a related query';
+  await input.emit('input');
+  await until(() => fixture.element('#search-status').textContent === '1 results · 1 tasks still being indexed');
+  assert.equal(fixture.rows.get('one').row.find('similarity').textContent, 'Similarity 0.90');
+  assert.equal(fixture.element('#search-explain').hidden, false);
+  mode = 'error';
+  input.value = 'a failing query';
+  await input.emit('input');
+  await until(() => fixture.element('#search-status').textContent === 'Search failed');
+});
+
+test('clearing or Escape removes scores and restores normal order', async () => {
+  const fixture = appFixture({ items: [savedTask('one'), savedTask('two')],
+    current: ['one', 'two'], onFetch: async ({ url, tasks }) => {
+      if (url === '/api/todos/search') {
+        return apiResponse({ matches: [{ todo: tasks.get('two'), score: 0.81 }], pending_count: 0 });
+      }
+    },
+  });
+  await until(() => fixture.rows.size === 2);
+  fixture.ready();
+  const input = fixture.element('#todo-search');
+  for (const action of ['clear', 'escape']) {
+    input.value = 'a query';
+    await input.emit('input');
+    await until(() => fixture.element('#search-status').textContent === '1 results');
+    assert.equal(fixture.rows.get('two').row.find('similarity').textContent, 'Similarity 0.81');
+    assert.equal(fixture.element('#search-explain').hidden, false);
+    if (action === 'clear') await fixture.element('#search-clear').emit('click');
+    else await input.emit('keydown', { key: 'Escape' });
+    assert.equal(input.value, '');
+    assert.equal(fixture.rows.get('two').row.find('similarity').hidden, true, 'Clearing removes obsolete scores');
+    assert.equal(fixture.rows.get('one').row.find('nonmatch').hidden, true);
+    assert.equal(fixture.element('#search-explain').hidden, true);
+    assert.equal(fixture.element('#search-status').hidden, true);
+    assert.deepEqual(fixture.element('#todo-list').children.map(element => element.dataset.id), ['one', 'two']);
+  }
+  assert.equal(fixture.document.activeElement, input);
+});
+
 // Opt-in real inference using authentic downloads in .venv/model-assets.
 // The ordinary suite stays offline and needs only Node. This check additionally
 // needs playwright@1.55.1 installed under .venv/model-browser and its Chromium.

@@ -72,6 +72,8 @@ h2 { font-size: .9rem; margin: 0; font-weight: 600; }
 }
 .heading-actions { display: flex; gap: 4px 12px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .model-indicator { display: flex; gap: 8px; align-items: center; min-width: 0; flex-wrap: wrap; margin-top: 28px; font-size: .8rem; line-height: 1.5; color: #77746c; }
+.model-statusbar { position: sticky; top: 0; z-index: 20; width: 100%; margin-top: 0; background: #fff; border-bottom: 1px solid #e9e9e6; }
+.model-statusbar-inner { max-width: 780px; margin: 0 auto; padding: 10px 36px; display: flex; gap: 8px; align-items: center; min-width: 0; flex-wrap: wrap; font-size: .8rem; line-height: 1.5; color: #77746c; }
 .model-dot { width: 8px; height: 8px; border-radius: 50%; background: #d4d2cb; flex-shrink: 0; }
 .model-indicator.is-busy .model-dot { background: #68665d; animation: model-pulse 1.1s ease-in-out infinite; }
 .model-indicator.is-ready .model-dot { background: #2f7d32; }
@@ -84,11 +86,19 @@ h2 { font-size: .9rem; margin: 0; font-weight: 600; }
 #todo-search { flex: 1; min-width: 0; height: var(--control-size); padding: 7px 8px; border: 1px solid #e5e4df; border-radius: 4px; background: #fff; line-height: 1.45; }
 #todo-search:focus { outline: 2px solid #68665d; outline-offset: 2px; border-color: #b9b7af; }
 #todo-search::placeholder { color: #89867e; opacity: 1; }
+#todo-search::-webkit-search-cancel-button,
+#todo-search::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
+#todo-search::-ms-clear { display: none; height: 0; width: 0; }
 #search-status { margin: 8px 8px 0; color: #77746c; font-size: .8rem; line-height: 1.6; }
 #search-status:empty { display: none; }
+#search-explain { margin: 4px 8px 0; color: #77746c; font-size: .8rem; line-height: 1.6; }
+.similarity { grid-column: 3 / 5; margin: 0; padding: 2px 8px; font-size: .75rem; color: #77746c; font-variant-numeric: tabular-nums; }
+.nonmatch { grid-column: 3 / 5; margin: 0; padding: 2px 8px; font-size: .75rem; color: #77746c; font-style: italic; }
 @media (max-width: 480px) {
   .heading-actions { width: 100%; justify-content: flex-start; }
+  .model-statusbar-inner { padding: 8px 18px; }
   .model-indicator { margin-top: 20px; }
+  .model-statusbar { margin-top: 0; }
   #model-progress { width: min(160px, 100%); }
   .search-row { margin-left: 0; margin-right: 0; }
 }
