@@ -140,6 +140,10 @@ function resolveElements(options, root) {
     progress: options.progress || scoped('model-progress'),
     statusEl: options.statusEl || scoped('model-status'),
     errorEl: options.errorEl || scoped('model-error'),
+    cacheButton: options.cacheButton || scoped('model-cache-clear'),
+    offlineStatus: options.offlineStatus || scoped('offline-status'),
+    offlineError: options.offlineError || scoped('offline-error'),
+    offlineRetry: options.offlineRetry || scoped('offline-retry'),
   };
 }
 
@@ -159,12 +163,15 @@ export function initModelPanel(options = {}) {
   let attached = false;
   let destroyed = false;
   let autoStarted = false;
+  let offlineRuntime = options.offlineRuntime || null;
+  let offlineUnsubscribe = null;
 
   let snapshot = { phase: 'idle', progress: null, message: '' };
 
   function handleSnapshot(next) {
     snapshot = next;
     renderModelState(elements, next);
+    if (elements.cacheButton) elements.cacheButton.hidden = next.phase !== 'error' || typeof runtime?.clearCache !== 'function';
   }
 
   async function ensureRuntime() {
@@ -203,6 +210,46 @@ export function initModelPanel(options = {}) {
     }
   }
 
+  async function clearModelCache() {
+    if (destroyed || !runtime?.clearCache) return;
+    if (elements.cacheButton) elements.cacheButton.disabled = true;
+    try { await runtime.clearCache(); await activate(); }
+    catch (error) { handleSnapshot({ phase:'error', message:error.message }); }
+    finally { if (elements.cacheButton) elements.cacheButton.disabled = false; }
+  }
+
+  function renderOffline(next) {
+    if (destroyed) return;
+    if (elements.offlineStatus) elements.offlineStatus.textContent = next.phase === 'ready' ? 'App cached.'
+      : next.phase === 'caching' ? 'Caching app…' : '';
+    const failed = next.phase === 'error' || next.phase === 'unsupported';
+    if (elements.offlineError) {
+      elements.offlineError.hidden = !failed;
+      elements.offlineError.textContent = failed ? next.message || 'App cache unavailable.' : '';
+    }
+    if (elements.offlineRetry) {
+      elements.offlineRetry.hidden = !failed;
+      elements.offlineRetry.disabled = next.phase === 'unsupported';
+    }
+  }
+
+  async function initializeOffline() {
+    try {
+      if (!offlineRuntime) offlineRuntime = (await import('./offline.mjs')).offlineRuntime;
+      if (destroyed) return;
+      offlineUnsubscribe = offlineRuntime.subscribe(renderOffline);
+      await offlineRuntime.initialize();
+    } catch (error) { renderOffline({ phase:'error', message:error.message || 'App cache unavailable.' }); }
+  }
+
+  async function retryOffline() {
+    if (destroyed) return;
+    try {
+      if (offlineRuntime) await offlineRuntime.recover();
+      else await initializeOffline();
+    } catch (error) { renderOffline({ phase:'error', message:error.message }); }
+  }
+
   function autoStart() {
     if (autoStarted) return;
     autoStarted = true;
@@ -217,6 +264,9 @@ export function initModelPanel(options = {}) {
       unsubscribe();
       unsubscribe = null;
     }
+    offlineUnsubscribe?.();
+    elements.offlineRetry?.removeEventListener('click', retryOffline);
+    elements.cacheButton?.removeEventListener('click', clearModelCache);
   }
 
   // Eagerly subscribe when a runtime was injected so the panel reflects
@@ -235,8 +285,11 @@ export function initModelPanel(options = {}) {
   // Load automatically once during page initialization; the retry button
   // remains for failures.
   autoStart();
+  elements.cacheButton?.addEventListener('click', clearModelCache);
+  elements.offlineRetry?.addEventListener('click', retryOffline);
+  if (offlineRuntime || elements.offlineStatus) void initializeOffline();
 
-  return { activate, destroy, elements };
+  return { activate, destroy, elements, clearModelCache, retryOffline };
 }
 
 // Self-initialize in the browser only; Node-based checks import the

@@ -1,6 +1,9 @@
 // This module does not import Transformers.js or create a worker until activation.
 import { MODEL_ARTIFACT, TASK_INPUT_VERSION, taskSnapshot, queryText } from './model-worker.mjs';
 
+import { modelCache } from './model-cache.mjs';
+import { offlineRuntime } from './offline.mjs';
+
 const IDLE = Object.freeze({
   phase: 'idle', progress: null, message: 'Load EmbeddingGemma 2 on this device.',
 });
@@ -10,6 +13,7 @@ export function createModelRuntime({
   supportsWebGPU = () => globalThis.isSecureContext === true
     && typeof globalThis.Worker === 'function' && !!globalThis.navigator?.gpu,
   inactivityTimeoutMs = 180_000,
+  clearModelCache = () => modelCache.clear(),
 } = {}) {
   let state = IDLE;
   let worker = null;
@@ -221,7 +225,14 @@ export function createModelRuntime({
     publish(IDLE.phase, IDLE.progress, IDLE.message);
   }
 
-  return Object.freeze({ loadAndTest, embedTask, embedQuery, subscribe, dispose });
+  async function clearCache() {
+    dispose();
+    await clearModelCache();
+  }
+  return Object.freeze({ loadAndTest, embedTask, embedQuery, subscribe, dispose, clearCache });
 }
 
 export const modelRuntime = createModelRuntime();
+
+// Prepare ordinary offline task controls independently of model activation.
+if (typeof window !== 'undefined') void offlineRuntime.initialize().catch(() => {});

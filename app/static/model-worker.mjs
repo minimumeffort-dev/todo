@@ -1,3 +1,4 @@
+import { modelCache, ModelCacheError } from './model-cache.mjs';
 // Verified against the repository's immutable configuration and model card:
 // embedding_gemma2, AutoTokenizer, text-only model_q4.onnx + its external data.
 // The model card recommends q4 on WebGPU; Transformers.js 4.3.1 supports this
@@ -11,7 +12,7 @@ export const MODEL_ARTIFACT = Object.freeze({
 });
 export const TASK_INPUT_VERSION = 1;
 export const TRANSFORMERS_VERSION = '4.3.1';
-export const TRANSFORMERS_URL = `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/transformers.min.js`;
+export const TRANSFORMERS_URL = '/vendor/transformers/transformers.min.js';
 const SAMPLE = 'A small test sentence for the local to-do model.';
 const SETUP_MESSAGE = 'EmbeddingGemma 2 setup is incomplete: its immutable ONNX revision, tokenizer and WebGPU weights must be verified before loading.';
 const TASK_ICONS = new Set(['task', 'star', 'home', 'work', 'shopping', 'heart']);
@@ -99,6 +100,7 @@ export function createModelWorker({
   importRuntime = () => import(TRANSFORMERS_URL),
   artifact = MODEL_ARTIFACT,
   errorEvents = globalThis,
+  cache = modelCache,
 } = {}) {
   let active = null;
   let model = null;
@@ -145,18 +147,23 @@ export function createModelWorker({
       const { AutoConfig, AutoTokenizer, AutoModel, env } = await importRuntime();
       checkCurrent();
       if (env.version !== TRANSFORMERS_VERSION) throw new ModelFailure('error', 'The model runtime version does not match its pin. Reload and retry.');
-      env.allowLocalModels = false;
-      env.allowRemoteModels = true;
-      // 4.3.1's tokenizer existence probe omits its revision option. Pin the
-      // URL template too, so even metadata requests use the verified commit.
+      stage = 'cache';
+      const saved = await cache.prepare(info => emit('loading', info.progress, info.message));
+      checkCurrent();
+      if (!saved.complete) throw new ModelCacheError('Model files have not finished saving. Please retry.');
+      env.allowLocalModels = true;
+      env.allowRemoteModels = false;
+      env.localModelPath = '/models/';
       env.remotePathTemplate = `{model}/resolve/${artifact.revision}/`;
-      // Use the browser's usual origin-scoped cache when available.
-      env.useBrowserCache = typeof globalThis.caches !== 'undefined';
+      env.useBrowserCache = env.useFSCache = false;
+      env.useCustomCache = true;
+      env.customCache = saved.customCache;
+      env.backends.onnx.wasm.wasmPaths = '/vendor/onnx/';
       // Inference stays in this worker even when cross-origin isolation is absent.
       env.backends.onnx.wasm.numThreads = 1;
       env.backends.onnx.wasm.proxy = false;
 
-      const options = { revision: artifact.revision };
+      const options = { revision: artifact.revision, local_files_only: true };
       stage = 'configuration';
       emit('loading', null, 'Loading the pinned EmbeddingGemma 2 configuration…');
       const config = await AutoConfig.from_pretrained(artifact.id, options);
@@ -186,7 +193,7 @@ export function createModelWorker({
             if (progress === null || lastProgress === null || progress === 1 || now - lastProgressAt >= 100) {
               lastProgressAt = now;
               lastProgress = progress;
-              emit('loading', progress, 'Downloading EmbeddingGemma 2 weights…');
+              emit('loading', progress, 'Loading saved EmbeddingGemma 2 weights…');
             }
           }
         },
@@ -205,8 +212,8 @@ export function createModelWorker({
     } catch (error) {
       discardTensors(inputs, output);
       await releaseModel();
-      const message = error instanceof ModelFailure ? error.message
-        : stage === 'runtime' ? 'Could not load Transformers.js. Check access to cdn.jsdelivr.net and your connection, then retry.'
+      const message = error instanceof ModelFailure || error instanceof ModelCacheError ? error.message
+        : stage === 'runtime' ? 'Could not load the local Transformers.js runtime. Reload the app or repair its offline cache, then retry.'
           : stage === 'inference' ? 'The EmbeddingGemma 2 test failed. Check available GPU memory or restart the browser, then retry.'
             : 'Could not load EmbeddingGemma 2. Check access to huggingface.co and model download hosts, connection and GPU memory, then retry.';
       emit(error instanceof ModelFailure ? error.phase : 'error', null, message);
