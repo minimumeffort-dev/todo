@@ -1,100 +1,134 @@
 # Local To-do
 
-A local FastAPI app with DuckDB storage. Add tasks, edit titles and icons, mark
-tasks as done, and reopen them later. Completed tasks stay in the list. Saved
-tasks and their completion states remain after reloading the page or restarting
-the app.
+A to-do app that runs entirely in the browser. Add tasks, edit titles and
+icons, mark tasks as done, and reopen them later. Completed tasks stay in the
+list. Saved tasks, their completion states and their search embeddings are
+stored locally in your browser and remain after reloading the page,
+restarting the browser, or going offline. There is no server, no account,
+and no cross-device sync.
 
-## Built with Sprowt Harness
+## Quick start
 
-This is the sample app I’m building with [Sprowt Harness](https://github.com/minimumeffort-dev/sprowt.harness), my local coding harness for Codex and Muse. I’m developing the app alongside the harness so its commits and pull requests provide a concrete record of the work.
-
-Follow the [app’s commits](https://github.com/minimumeffort-dev/todo/commits/main/) and [pull requests](https://github.com/minimumeffort-dev/todo/pulls), browse the [harness](https://github.com/minimumeffort-dev/sprowt.harness), or read the [build notes](https://minimumeffort.dev/blog). Both projects are in development.
-
-## Install
-
-Use Python 3.10 or newer. The app was verified with Python 3.12.
-Run these commands from the project directory:
+You need Node 22 and npm 10 (see `package.json` engines). No Python is
+required to run or deploy the app.
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[test]'
+ONNXRUNTIME_NODE_INSTALL=skip npm ci
+npm run dev
 ```
 
-The `test` extra installs pytest and HTTPX for the API tests. For the app alone,
-use `.venv/bin/python -m pip install -e .` instead.
-
-## Run locally
+Open the printed loopback URL (for example <http://127.0.0.1:5173>) in a
+browser with JavaScript enabled. `npm run dev` serves the same local asset
+URLs as production; source edits appear after reload.
 
 ```sh
-.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+npm run build    # reproducible static output in dist/
+npm run preview  # serve the built app locally
 ```
 
-Open <http://127.0.0.1:8000> in a browser with JavaScript enabled. Choose
-**+ New task**, write a task, then press Enter or choose **Add**. The inline
-composer stays ready for consecutive tasks. Escape or **×** closes it and
-discards the new-task draft. Task is the default icon.
+Choose **+ New task**, write a task, then press Enter or choose **Add**. The
+inline composer stays ready for consecutive tasks. Escape or **×** closes it
+and discards the new-task draft. Task is the default icon.
 
-Use a task's checkbox to mark it as done; uncheck it to reopen it. You can also
-Tab to the checkbox and press Space. Completed tasks have crossed-out titles and
-remain visible, counted, and in the same order. You can still edit or remove them.
-Changing completion preserves unsaved title and icon drafts without saving them.
+Use a task's checkbox to mark it as done; uncheck it to reopen it. You can
+also Tab to the checkbox and press Space. Completed tasks have crossed-out
+titles and remain visible, counted, and in the same order. You can still edit
+or remove them. Changing completion preserves unsaved title and icon drafts
+without saving them.
 
-Click a title, or Tab to it and press Enter or Space,
-to open a borderless inline editor. Enter or leaving the row saves; moving to
-the row's checkbox, icon, or remove control keeps the draft available for that action.
-Escape in the editor restores the saved title and icon. Click a task's icon to
-open its picker; selecting an icon saves it with any title draft. The composer
-also has an icon picker. Use Tab or arrow keys to choose an icon, Enter or Space
-to select it, and Escape to close the picker. Saving a title or icon preserves
-the task's completion state.
+Click a title, or Tab to it and press Enter or Space, to open a borderless
+inline editor. Enter or leaving the row saves; moving to the row's checkbox,
+icon, or remove control keeps the draft available for that action. Escape in
+the editor restores the saved title and icon. Click a task's icon to open its
+picker; selecting an icon saves it with any title draft. The composer also
+has an icon picker. Use Tab or arrow keys to choose an icon, Enter or Space
+to select it, and Escape to close the picker. Saving a title or icon
+preserves the task's completion state.
 
 The **×** remove control appears on hover or keyboard focus and stays visible
 on touch devices. It is announced as “Remove” and the saved task title.
-Removal is immediate. Focus moves to the next visible available task, the previous visible task,
-or the composer. Removing an edited task does not save its draft.
-Failed saves and removals leave the task and drafts available with a **Retry**
-control. Failed completion changes restore the last confirmed checkbox state;
-**Retry** repeats the requested completion or reopening and keeps drafts available.
-Failed additions retain the composer input and icon; press Enter or
-**Add** to retry. Other rows remain available while a request is pending.
+Removal is immediate. Focus moves to the next visible available task, the
+previous visible task, or the composer. Removing an edited task does not save
+its draft. Failed saves and removals leave the task and drafts available with
+a **Retry** control. Failed completion changes restore the last confirmed
+checkbox state; **Retry** repeats the requested completion or reopening and
+keeps drafts available. Failed additions retain the composer input and icon;
+press Enter or **Add** to retry. Other rows remain available while a request
+is pending. A save only counts as successful after the database confirms
+durability; anything else keeps your draft and says so.
 
 **Refresh** reloads tasks, including changes from other tabs, while preserving
-unsaved title and icon drafts. It also updates completion while a task is being
-edited. Failed requests display an error and preserve your input or existing task.
-Saved titles, icons, and completion states remain after reloading or restarting.
-Stop the server with Ctrl+C.
+unsaved title and icon drafts. It also updates completion while a task is
+being edited. Failed requests display an error and preserve your input or
+existing task. Saved titles, icons, and completion states remain after
+reloading or restarting. Drafts are never written to backups or submitted
+implicitly.
+
+## Storage architecture
+
+Tasks and embeddings live in a DuckDB database that runs inside a dedicated
+browser worker (DuckDB-Wasm **1.33.1-dev65.0**) and persists to the browser's
+Origin Private File System (OPFS). Every mutation is acknowledged only after
+commit, checkpoint and a native OPFS flush succeed; a save that cannot be
+confirmed keeps your draft and reports an unconfirmed save instead of
+pretending it succeeded. If OPFS or Web Locks are unavailable, the app shows
+a clear error — it never silently falls back to temporary storage.
+
+The repository preserves the original semantics: UUID ids, creation-time/ID
+ordering, six icon values (`task`, `star`, `home`, `work`, `shopping`,
+`heart`), trimmed 1–500-character titles, strict booleans, and automatic
+migration defaults for older data (missing icons become Task, existing tasks
+start incomplete when the completion field is added). Vectors are stored
+directly as `FLOAT[]` alongside the pinned model id, immutable revision,
+input-format version and dimension count. Completion changes and
+unchanged-source saves preserve embeddings; source edits invalidate them
+atomically and schedule re-indexing.
+
+Multiple tabs share one database safely: exactly one tab's worker holds the
+origin-wide exclusive Web Lock and serves the OPFS file, while other tabs
+proxy repository calls to the owner over local message channels and
+reconcile by sequence after sleep or resume. Stale edits and late embedding
+results carry revision tokens and are rejected with a conflict instead of
+overwriting newer values; uncertain replies are recovered by retrying with
+the same operation id rather than duplicating the write.
+
+Request persistent browser storage when the app starts; denial is reported
+in the storage panel (export a backup) rather than blocking task use. Quota
+and flush failures roll the mutation back and surface as explicit errors
+with **Retry**, reusing the same operation id.
 
 ## Model loading and search
 
-EmbeddingGemma 2 loads automatically when the page opens. A full-width status
-bar above the page heading animates during setup and download; **Model ready**
-means a built-in sample produced valid output on WebGPU. Task controls remain usable
-while the model loads or if loading fails. Failure details and **Retry** appear
-in the status bar. Retry starts a fresh worker after a failure or timeout.
+EmbeddingGemma 2 inference stays in a browser module worker using WebGPU and
+the pinned, SHA-256-verified model files. Task controls remain usable while
+the model loads or if loading fails; the compact model indicator sits above
+the page heading, separate from task rows. **Model ready** means a built-in
+sample produced valid output. Failure details and **Retry** appear in the
+indicator. Retry starts a fresh worker after a failure or timeout.
 
-Use **Search tasks** to find saved tasks by meaning, including completed tasks.
-For example, “purchase food” can find a grocery task. Queries accept 1–500
-characters and wait for model readiness. Results include only tasks meeting the
-minimum cosine similarity, ranked from closest meaning to least, up to 20 tasks.
-Search may return **No matching tasks** even when all tasks are indexed.
-Each match shows its raw score, such as **Similarity 0.72**. Higher cosine
-similarity means closer meaning; it is not a confidence or probability score.
-The status reports when some tasks still lack embeddings, so an incomplete
-index is distinguishable from an empty
-one. Results update as indexing finishes. Search guidance uses the minimum score
-returned by the server. **Clear search**, or Escape in the
-search field, restores normal list order and removes search scores. The field
-has one **Clear search** control. Search updates preserve row drafts, retry
-controls, and keyboard focus. A nonmatching row retained for a draft, pending
-action or background processing, retry, or focus says **Not a search match**,
-has no score, and does not contribute to the result count. It disappears once
-its draft, pending action, error, or focus no longer needs protection. Changing
+Use **Search tasks** to find saved tasks by meaning, including completed
+tasks. For example, “purchase food” can find a grocery task. Queries accept
+1–500 characters and wait for model readiness. Results include only tasks
+meeting the minimum cosine similarity, ranked from closest meaning to least,
+up to 20 tasks. Search may return **No matching tasks** even when all tasks
+are indexed. Each match shows its raw score, such as **Similarity 0.72**.
+Higher cosine similarity means closer meaning; it is not a confidence or
+probability score. The status reports when some tasks still lack embeddings,
+so an incomplete index is distinguishable from an empty one. Results update
+as indexing finishes. Search guidance uses the minimum score returned by the
+local repository. **Clear search**, or Escape in the search field, restores
+normal list order and removes search scores. The field has one **Clear
+search** control. Search updates preserve row drafts, retry controls, and
+keyboard focus. A nonmatching row retained for a draft, pending action or
+background processing, retry, or focus says **Not a search match**, has no
+score, and does not contribute to the result count. It disappears once its
+draft, pending action, error, or focus no longer needs protection. Changing
 a query or saved task source removes obsolete scores.
 
-The server uses an inclusive minimum cosine score of **0.70**, defined by
-`MIN_SEARCH_COSINE_SIMILARITY` in `app/db.py`. The pinned q4 model produced these
-scores with the saved task input format and icons below:
+The local repository uses an inclusive minimum cosine score of **0.70**,
+defined by `MIN_SEARCH_SCORE` in `app/static/database-schema.mjs`. The
+pinned q4 model produced these scores with the saved task input format and
+icons below:
 
 | Query | Buy groceries (Shopping) | Read a novel (Star) |
 | --- | --- | --- |
@@ -102,35 +136,33 @@ scores with the saved task input format and icons below:
 | read a story | 0.612 | 0.759 |
 | repair the spacecraft engine | 0.598 | 0.639 |
 
-This heuristic cutoff retains both paraphrases, excludes the unrelated task, and allows
-the spacecraft query to return no matches. These fixtures calibrate a useful
-default for this model; reassess the cutoff if the model or input format changes.
+This heuristic cutoff retains both paraphrases, excludes the unrelated task,
+and allows the spacecraft query to return no matches. These fixtures
+calibrate a useful default for this model; reassess the cutoff if the model
+or input format changes.
 
-When the model becomes ready, the app fetches saved tasks with missing or
+When the model becomes ready, the app finds saved tasks with missing or
 incompatible embeddings and processes them in the background. This includes
-older tasks and tasks added during loading. **Refresh**, successful additions,
-and saved title or icon edits also check for missing embeddings. One background
-inference is submitted at a time so searches can interleave. Completion changes
-preserve embeddings; source edits invalidate them and trigger new processing.
+older tasks and tasks added during loading. **Refresh**, successful
+additions, and saved title or icon edits also check for missing embeddings.
+One background inference is submitted at a time so searches can interleave.
+Completion changes preserve embeddings; source edits invalidate them and
+trigger new processing.
 
-If inference or a vector upload fails, the task stays saved and gets a separate
-processing **Retry**. Retrying never creates another task. A failed upload reuses
-its computed vector; an inference retry computes a new one. **Refresh** also
-retries pending indexing. Changed or deleted snapshots are discarded, and
-conflicts from another tab are reconciled with the current saved source.
+If inference or a vector save fails, the task stays saved and gets a
+separate processing **Retry**. Retrying never creates another task. A failed
+save reuses its computed vector; an inference retry computes a new one.
+**Refresh** also retries pending indexing. Changed or deleted snapshots are
+discarded, and conflicts from another tab are reconciled with the current
+saved source.
 
-Inference stays in a browser module worker. Task embeddings use confirmed saved
-values, never unsaved drafts. Their input is exactly
-`Icon: <icon>\nTask: <title>` (input version 1), with the icon's text key such as
-`shopping`. Search embeds the trimmed query text with the same resident model.
-The resulting 768-value vectors and metadata go to the local FastAPI app for
-storage or ranking; inference does not send task or query text to a remote model
-service.
-
-Use a current WebGPU-capable browser with WebGPU in module workers, hardware
-acceleration, and enough GPU memory. Serve the app on **HTTPS or localhost**.
-If WebGPU is unavailable, ordinary task controls still work and the model panel
-explains why semantic search is unavailable.
+Inference stays in a browser module worker. Task embeddings use confirmed
+saved values, never unsaved drafts. Their input is exactly
+`Icon: <icon>\nTask: <title>` (input version 1), with the icon's text key
+such as `shopping`. Search embeds the trimmed query text with the same
+resident model. The resulting 768-value vectors and metadata go to the local
+database for storage and ranking; inference never sends task or query text
+to a remote model service, and the deployed app makes no task API requests.
 
 The verified pins are:
 
@@ -145,166 +177,97 @@ The verified pins are:
 The model loads only the text encoder and tokenizer. Model and tokenizer
 requests, including metadata probes, use the pinned revision.
 
-The first page load fetches approximately **234 MB of uncompressed assets**:
-about 175 MB of model graph/weights, 32 MB of tokenizer data, and 27 MB of runtime
-files. Network transfer varies with compression and caching. Downloads use
-`huggingface.co`, its CDN `us.aws.cdn.hf.co`, and `cdn.jsdelivr.net`.
-Network access starts automatically during page initialization.
+## Downloads and offline use
 
-Assets use the browser's origin-scoped cache when available. Reloading releases
-the resident worker and automatically loads again, reusing cached assets and
-current saved task vectors. Browser storage quotas, private browsing, cache
-eviction, or clearing site data may require another download.
+The first online visit downloads approximately **207 MB of model files**
+(about 174 MB of weights, 32 MB of tokenizer data, plus small configs) from
+`huggingface.co` and its CDN, verified by SHA-256 before use. The app shell
+(JavaScript, workers, Wasm, styles) is cached separately with a
+content-versioned service worker; the large model files live in exactly one
+managed cache and are never duplicated. Interrupted downloads and cache
+failures never report readiness: model readiness still requires successful
+inference, and cache recovery repairs only failed assets without touching
+the task database.
 
-## Storage
+After one successful online visit and a complete model download, the app
+reopens fully offline: task operations and semantic search work with no
+internet connection, reusing the downloaded assets. Ordinary task operations
+never depend on model availability. Cache cleanup and app updates preserve
+the OPFS task database.
 
-The default database location is `data/todos.duckdb` under the project directory.
-The app creates the directory and database on startup. Run one server process
-against a database file.
+## Browser requirements
 
-New tasks start incomplete. Startup upgrades older databases automatically:
-missing icons default to Task, and existing tasks start incomplete when the
-completion field is added. Existing titles, IDs, icons, and ordering are preserved.
-Startup also adds nullable embedding columns without changing saved tasks.
-DuckDB stores vectors directly as `FLOAT[]`, alongside the pinned model ID,
-immutable revision, input-format version, and dimension count. No separate vector
-database is needed. Vectors survive application restarts.
+Task persistence requires a secure origin (HTTPS or loopback), dedicated
+workers, Wasm, OPFS synchronous access handles, and Web Locks. Missing or
+denied persistent storage is an explicit error, not a silent fallback.
+Semantic search additionally requires WebGPU and the completed model
+download from the first online visit.
 
-To choose a different database location, set `TODO_DB_PATH` before starting:
+Verified here: Chromium 140 on Debian Linux (headless, including SwiftShader
+software WebGPU), covering OPFS write/flush/worker-termination/reload,
+persistent-profile browser restart, multi-tab locking, offline restart with
+real inference, and backup round-trips. Firefox, Safari, mobile browsers,
+private modes and embedded webviews have not been verified; API presence
+alone is not claimed as support. See
+[docs/browser-compatibility.md](docs/browser-compatibility.md) for the
+repeatable gate and the current support statement.
+
+## Backups
+
+**Export** downloads a versioned JSON backup
+(`{format: 'local-todo', version: 1, todos: [...]}`, at most 32 MB)
+preserving ids, titles, icons, completion, ordering timestamps and any saved
+vectors with metadata. **Import** validates the whole document before
+changing anything: bad JSON, wrong format/version, duplicate ids and invalid
+values are rejected with no changes, and imports that conflict with existing
+tasks are rejected atomically. Re-importing an identical backup skips
+unchanged records.
+
+Each browser profile and origin has its own data: there is no cross-device
+sync. Clearing site data removes local tasks, embeddings and cached assets
+(including the downloaded model). Keep an exported backup somewhere safe.
+
+## Deployment
+
+The deployment is static: `dist/` contains only browser sources and pinned
+runtime assets plus a content-hashed `asset-manifest.json`. No Python,
+FastAPI, server-side database or task API is involved, and no existing
+database or backup is bundled into the assets.
 
 ```sh
-TODO_DB_PATH=/absolute/path/to/todos.duckdb .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+ONNXRUNTIME_NODE_INSTALL=skip npm ci
+npm run build
 ```
+
+Deploy `dist/` to Vercel (see `vercel.json`: `npm run build`, output
+`dist/`, uncached service worker, no Python install). Exact steps:
+
+1. `npm run build` and confirm `dist/asset-manifest.json` exists.
+2. `vercel --prod` from the project directory (or connect the repository in
+   the Vercel dashboard; the checked-in `vercel.json` supplies the build).
+3. Open the deployed HTTPS origin, create a task, reload, and confirm it
+   persists; then export a backup.
+
+Actual deployment is a separate request; this repository only prepares the
+static configuration.
 
 ## Verify
 
-Use Python 3.12 and Node 22 for the verified test setup:
-
 ```sh
-.venv/bin/python -m pip install -e '.[test]' 'setuptools>=68' wheel
-mise install node@22
-.venv/bin/python tests/test_model_assets.py --check-suites
+ONNXRUNTIME_NODE_INSTALL=skip npm ci
+npm run build
+python3 tests/test_model_assets.py   # static dist, pins, retained unit suites
+npm test                             # repository, backup, runtime and panel suites
+npm run test:opfs                     # OPFS persistence gate (persistent profile)
+npm run test:integration              # persistence/restart, tabs, guards, backups, usability
+npm run test:network                 # offline restart, real inference, zero-backend audit
 ```
 
-The full Python suite uses temporary databases and includes both offline Node
-suites. It covers task lifecycle and persistence, legacy database upgrades,
-embedding validation and atomic uploads, pending eligibility, cosine filtering
-at the inclusive cutoff, no-match queries, stable ties and limits, and
-query/task inference serialization, failures, timeouts,
-and disposal. Static checks verify JavaScript serving and wheel packaging;
-panel tests verify automatic startup and accessible state changes.
-Set `MODEL_TEST_NODE` to an absolute Node executable path if it is outside PATH
-and the usual mise installation directory.
-
-Install the optional browser setup and prepare the pinned fixtures:
-
-```sh
-mise exec node@22 -- npm install --prefix .venv/model-browser --no-audit --no-fund playwright@1.55.1
-mise exec node@22 -- node .venv/model-browser/node_modules/playwright/cli.js install chromium webkit
-.venv/bin/python tests/test_model_assets.py --download-fixtures
-```
-
-Playwright reports missing native browser libraries on Linux. Fixture downloads
-are approximately 234 MB under the ignored `.venv/model-assets` directory and
-are verified against SHA-256 hashes; matching files are reused on later runs.
-
-Run each browser check separately:
-
-```sh
-.venv/bin/python tests/test_model_assets.py --check-flows
-.venv/bin/python tests/test_model_assets.py --check-focus
-.venv/bin/python tests/test_model_assets.py --check-webkit
-.venv/bin/python tests/test_model_assets.py --check-real
-.venv/bin/python tests/test_model_assets.py --check-real-book
-.venv/bin/python tests/test_model_assets.py --check-real-no-match
-.venv/bin/python tests/test_model_assets.py --check-real-cache
-```
-
-Each command starts and stops its own FastAPI server and browser in the same
-process, with temporary databases and dynamically allocated loopback ports.
-The three authentic query fixtures and the cache/reload scenario run separately
-so each command fits the VM's 30-second check limit, including initial
-software-GPU compilation.
-The flow check injects model inference while exercising the real DOM, API, and
-DuckDB: additions during loading, saved-snapshot backfill, current-vector reuse,
-source edits/deletions during inference, 404/409 reconciliation, inference and
-upload retries, rapid searches, scores, no-match and request-error states,
-clear/Escape, and draft/focus preservation for retained nonmatching rows.
-Browser actions await matching responses registered before the action and then
-assert the rendered state. Controlled request gates cover pending creation and
-saves; held search responses arrive after a newer query, clearing, or a source
-save to verify that obsolete results cannot overwrite the current view.
-A gated cross-tab source edit also verifies that the page refreshes before
-showing the new score, preserving a focused local draft and its selection
-without submitting it, including recovery after a failed source refresh.
-
-The focus checks use controlled inference and request gates with the real DOM,
-API, and DuckDB in Chromium and WebKit (Safari's browser engine). They cover
-focused and drafted nonmatches, save and processing retries, pending completion,
-held processing uploads remaining accessible after focus leaves, rows hiding
-after a blur to the page body or other protection ends, and deletion moving focus
-past hidden rows or to the composer. Desktop and 375px screenshots show the top
-model bar and one search clear control. They also check keyboard use, reduced motion, and
-model failure/retry. Search guidance must reflect the response's `min_score`.
-
-The real-model scenarios use the deployed worker and authentic pinned bytes in
-Chromium's browser cache. They verify automatic activation, loading failure and
-retry, missing-item backfill, paraphrase matches and unrelated-task exclusion,
-an unrelated query with no matches, cache reuse after reload, and
-persisted vectors after a server restart. Browser checks include a narrow
-layout, the top status bar, the hidden native search cancel control and reduced
-motion. Browser screenshots are saved under the ignored
-`.venv/browser-screenshots` directory for desktop and narrow inspection, with
-browser and scenario names in each filename.
-Chromium uses SwiftShader software WebGPU in the
-Linux VM; physical GPU and browser performance varies. The cache/reload scenario
-also verifies that unsupported WebGPU leaves task controls available.
-On reload, reaching the sample-test phase confirms that the fresh worker loaded
-the cached tokenizer and weights. The cache/reload check stops Chromium at that
-point; its first sample and real task inference have already passed.
-
-Browser tests are opt-in under ordinary pytest runs. Set `MODEL_BROWSER_CHECK=1`
-to include them, or use the browser commands above.
-
-The API is available at `GET /api/todos`, `POST /api/todos` (JSON body
-`{"title": "Buy groceries", "icon": "shopping"}`), `PUT /api/todos/{id}`
-(a JSON body with both `title` and `icon`), `PATCH /api/todos/{id}`
-(JSON body `{"completed": true}` to complete or `{"completed": false}` to reopen),
-and `DELETE /api/todos/{id}`. Every task response includes `id`, `title`, `icon`,
-and a boolean `completed`. PATCH changes only completion and returns the full
-task; repeating the same state is safe. Missing or non-boolean `completed` values
-return 422. Unknown task IDs return 404 with `{"detail": "To-do item not found"}`.
-Title and icon updates preserve completion, and listing includes both completed
-and incomplete tasks in their existing order.
-Icon values are `task` (the default when adding), `star`, `home`, `work`,
-`shopping`, and `heart`. Titles are trimmed and must contain 1–500 characters.
-Interactive API documentation is at
-<http://127.0.0.1:8000/docs> while the app runs.
-
-`PUT /api/todos/{id}/embedding` accepts
-`{title, icon, vector, model, revision, input_version, dimensions}`. Use the pinned
-model and revision above, input version `1`, and exactly `768` finite
-float32-compatible values forming a nonzero vector. Success returns 204;
-incompatible metadata or an invalid vector returns 422, a missing task returns
-404, and a changed title/icon snapshot returns 409. Source comparison and the
-vector write are atomic.
-Ordinary task responses still contain only `id`, `title`, `icon`, and `completed`.
-
-`GET /api/todos/embeddings/pending` returns ordinary task objects in list order
-for missing or incompatible embeddings. Compatibility requires the current
-model, revision, input version, dimensions, and a usable finite nonzero vector.
-
-`POST /api/todos/search` accepts
-`{vector, model, revision, input_version, dimensions, limit?}` with the same
-vector validation as uploads. `limit` defaults to 20 and must be an integer from
-1 to 100. The response is `{matches: [{todo, score}], pending_count, min_score}`.
-`min_score` is the server-owned inclusive cutoff, currently **0.70**, and is
-included even when there are no matches. It is a heuristic cosine threshold,
-not a probability; clients cannot override it in the request. Only
-compatible vectors with cosine score **at least `min_score`** are ranked by descending
-similarity, with ties in
-creation-time/ID order; `pending_count` reports tasks still missing compatible
-vectors. Invalid input returns a sanitized 422 response. An empty index returns
-an empty `matches` list, as does a query with no sufficiently similar tasks.
-Weak compatible matches are excluded rather than used to fill the limit, and
-do not increase `pending_count`.
+`tests/test_model_assets.py` needs only the system Python 3 standard library
+plus Node 22 (`MODEL_TEST_NODE` overrides discovery). Browser specs start
+their own ephemeral loopback servers and persistent profiles, close
+everything themselves, and keep reusable model downloads under
+`XDG_CACHE_HOME`; no profile or private database enters the build. The
+offline inference check needs the five pinned model files cached locally
+(about 207 MB, SHA-256 verified on use) and a WebGPU-capable Chromium;
+without them it reports the missing cache instead of passing.
