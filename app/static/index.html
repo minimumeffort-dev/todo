@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Local To-do</title>
   <link rel="stylesheet" href="/static/styles.css">
-  <script src="/static/app.js" defer></script>
+  <script type="module" src="/static/app.js"></script>
   <script type="module" src="/static/model-panel.mjs"></script>
 </head>
 <body>
@@ -16,6 +16,10 @@
       <progress id="model-progress" max="1" hidden></progress>
       <span id="model-error" class="error" role="alert" hidden></span>
       <button id="model-load" class="secondary" type="button" hidden>Retry</button>
+      <button id="model-cache-clear" class="secondary" type="button" hidden>Clear model cache</button>
+      <span id="offline-status" role="status"></span>
+      <span id="offline-error" class="error" role="alert" hidden></span>
+      <button id="offline-retry" class="secondary" type="button" hidden>Retry app cache</button>
     </div>
   </div>
   <main>
@@ -31,6 +35,16 @@
         <div class="heading-actions">
           <button id="refresh-button" class="secondary" type="button">Refresh</button>
         </div>
+      </div>
+      <div id="storage-panel" class="storage-panel" role="group" aria-label="Local storage and backups">
+        <div class="storage-actions">
+          <button id="backup-export" class="secondary" type="button">Export</button>
+          <button id="backup-import" class="secondary" type="button">Import</button>
+          <input id="backup-file" type="file" accept="application/json,.json" aria-label="Import task backup" hidden>
+          <button id="storage-retry" class="secondary" type="button" hidden>Retry storage</button>
+        </div>
+        <p id="storage-status" role="status">Opening local storage…</p>
+        <p id="storage-error" class="error" role="alert" hidden></p>
       </div>
       <div class="search-row" role="search">
         <label class="sr-only" for="todo-search">Search tasks</label>

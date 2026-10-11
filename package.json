@@ -1,0 +1,30 @@
+{
+  "name": "local-todo-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.16.0 <23"
+  },
+  "packageManager": "npm@10.9.2",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "node --test tests/*.test.mjs",
+    "test:opfs": "node --test tests/browser/opfs.spec.mjs",
+    "test:integration": "node --test tests/browser/integration.spec.mjs",
+    "test:network": "node --test tests/browser/network.spec.mjs",
+    "test:static": "python3 tests/test_model_assets.py",
+    "verify": "npm run build && npm test && npm run test:static"
+  },
+  "dependencies": {
+    "@duckdb/duckdb-wasm": "1.33.1-dev65.0",
+    "@huggingface/transformers": "4.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.1",
+    "esbuild": "0.25.12",
+    "vite": "7.1.3"
+  }
+}

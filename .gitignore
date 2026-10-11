@@ -8,3 +8,11 @@ build/
 data/
 *.duckdb
 *.duckdb.wal
+node_modules/
+playwright-report/
+test-results/
+.vercel/
+.cache/
+*.db
+*.db.wal
+*.backup.json

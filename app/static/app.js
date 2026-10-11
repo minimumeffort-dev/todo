@@ -1,3 +1,175 @@
+// Persistence is local; only the repository's durable acknowledgement clears drafts.
+let repository = null;
+let repositoryPromise = null;
+let repositoryConnection = null;
+let storagePanel = null;
+let storageInitialization = null;
+let storageFailure = null;
+let databaseSequence = -1;
+let observedDatabaseSequence = -1;
+let reconciliationNeeded = false;
+let reconciliationScheduled = false;
+let composerAttempt = null;
+const operationId = () => crypto.randomUUID();
+
+// Return the RPC endpoint immediately. The coordinator's election lock must
+// release before this worker can acquire that same lock for its open lifetime.
+// initialize() waits for the worker's ready message before sending any RPC.
+function spawnDatabaseOwner(contract) {
+  const worker = new Worker('/static/database-worker.mjs', { type: 'module' });
+  const pending = new Map();
+  let requestId = 0;
+  let failed = null;
+  let resolveReady, rejectReady;
+  const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  // Initialization attaches its wait after election; observe an early failure.
+  ready.catch(() => {});
+  function stop(message) {
+    if (failed) return;
+    failed = new contract.StorageError('unavailable', message);
+    clearTimeout(startupTimer);
+    rejectReady(failed);
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new contract.StorageError(waiter.operationId ? 'unconfirmed' : 'unavailable',
+        waiter.operationId ? 'Save not confirmed. Retry the same change.' : message,
+        { operationId: waiter.operationId }));
+    }
+    pending.clear();
+    worker.terminate();
+  }
+  const startupTimer = setTimeout(() => stop('The database worker could not acquire persistent storage. Retry storage.'), 20000);
+  worker.onerror = event => { event.preventDefault?.(); stop(event.message || 'The database worker stopped.'); };
+  worker.onmessageerror = () => stop('The database worker reply could not be read.');
+  worker.onmessage = ({ data }) => {
+    if (data?.ready === true) { clearTimeout(startupTimer); resolveReady(); return; }
+    const waiter = pending.get(data?.id);
+    if (!waiter || data.version !== contract.STORAGE_PROTOCOL_VERSION) return;
+    pending.delete(data.id);
+    clearTimeout(waiter.timer);
+    if (data.ok) waiter.resolve(data.value);
+    else waiter.reject(contract.restoreStorageError(data.error));
+  };
+  async function call(method, args) {
+    const operation = args.find(value => value && typeof value === 'object' && value.operationId);
+    await ready;
+    if (failed) {
+      if (operation?.operationId) throw new contract.StorageError('unconfirmed',
+        'Save not confirmed. Retry the same change.', { operationId: operation.operationId });
+      throw failed;
+    }
+    return new Promise((resolve, reject) => {
+      const id = ++requestId;
+      const timer = setTimeout(() => stop('The database worker did not confirm the operation.'), 20000);
+      pending.set(id, { resolve, reject, timer, operationId: operation?.operationId });
+      try { worker.postMessage({ version: contract.STORAGE_PROTOCOL_VERSION, id, method, args }); }
+      catch { stop('The database worker request could not be sent.'); }
+    });
+  }
+  return {
+    ...Object.fromEntries(contract.REPOSITORY_METHODS.map(method => [method, (...args) => call(method, args)])),
+    get failed() { return failed !== null; },
+    close: () => stop('The database worker was closed.'),
+  };
+}
+
+function createBrowserRepository(module, contract) {
+  if (!globalThis.isSecureContext || !navigator.locks?.request || !navigator.storage?.getDirectory
+    || typeof Worker !== 'function' || typeof BroadcastChannel !== 'function') {
+    throw new contract.StorageError('unavailable', 'Persistent storage requires a secure origin, OPFS, Web Locks and browser workers.');
+  }
+  const channel = new BroadcastChannel(contract.DATABASE_CHANNEL);
+  let owner = null;
+  const store = module.createCoordinator({
+    locks: navigator.locks,
+    storage: navigator.storage,
+    channel,
+    spawnOwner: () => { owner = spawnDatabaseOwner(contract); return owner; },
+  });
+  return {
+    store,
+    async recover() {
+      if (owner?.failed) {
+        // The dead endpoint can never service another call. Re-elect through
+        // the coordinator, retaining subscriptions and durable operation IDs.
+        owner.close();
+        owner = null;
+        return store.reconnect();
+      }
+      // Quota/flush recovery keeps a healthy owner and its exclusive lock.
+      // Client timeouts are already marked lost by the coordinator.
+      return store.initialize();
+    },
+    close() { owner?.close(); channel.close(); },
+  };
+}
+
+async function getRepository() {
+  if (repository) return repository;
+  if (!repositoryPromise) repositoryPromise = Promise.all([
+    import('/static/database-coordinator.mjs'), import('/static/storage-contract.mjs'),
+  ]).then(async ([module, contract]) => {
+    const connection = createBrowserRepository(module, contract);
+    const store = connection.store;
+    let result;
+    try { result = await store.initialize(); }
+    catch (exception) { connection.close(); throw exception; }
+    repositoryConnection = connection;
+    storageInitialization = result;
+    repository = store;
+    storagePanel?.setReady(result);
+    store.subscribe(event => {
+      observedDatabaseSequence = Math.max(observedDatabaseSequence, event.sequence);
+      if (event.sequence > databaseSequence) {
+        tasksChanging();
+        reconciliationNeeded = true;
+        scheduleReconciliation();
+      }
+    });
+    return store;
+  }).catch(exception => {
+    repositoryPromise = null;
+    storageFailure = exception;
+    storagePanel?.setError(exception);
+    throw exception;
+  });
+  return repositoryPromise;
+}
+async function localCall(method, ...args) {
+  try {
+    const store = await getRepository();
+    return await store[method](...args);
+  } catch (exception) {
+    if (!['validation', 'missing', 'conflict'].includes(exception.code)) {
+      storageFailure = exception;
+      storagePanel?.setError(exception);
+    }
+    throw exception;
+  }
+}
+function scheduleReconciliation() {
+  if (reconciliationScheduled || !reconciliationNeeded) return;
+  reconciliationScheduled = true;
+  queueMicrotask(async () => {
+    reconciliationScheduled = false;
+    if (loading || adding || [...rows.values()].some(state => state.pending)) return;
+    await loadItems();
+  });
+}
+function sourceMatches(record, job) {
+  return record.source_revision === job.sourceRevision && sameSource(record.todo, job.snapshot);
+}
+function acceptRecord(state, record) {
+  invalidateEmbedding(state, record);
+  state.item = record.todo;
+  state.recordRevision = record.revision;
+  state.sourceRevision = record.source_revision;
+  state.missing = false;
+}
+function uncertain(exception) {
+  return !['validation', 'missing', 'conflict'].includes(exception.code)
+    && ![404, 409, 422].includes(exception.status);
+}
 const form = document.querySelector('#todo-form');
 const input = document.querySelector('#todo-title');
 const addButton = document.querySelector('#add-button');
@@ -67,19 +239,6 @@ function showError(message = '') {
   error.textContent = message;
   error.hidden = !message;
 }
-async function request(url, options = {}) {
-  let response;
-  try { response = await fetch(url, options); }
-  catch { throw new Error('Could not reach the local app. Try again.'); }
-  if (!response.ok) {
-    let detail;
-    try { detail = (await response.json()).detail; } catch { /* Fall back to status. */ }
-    const exception = new Error(typeof detail === 'string' ? detail : `Request failed (${response.status}). Please try again.`);
-    exception.status = response.status;
-    throw exception;
-  }
-  return response.status === 204 ? null : response.json();
-}
 function updateRefresh() {
   refreshButton.disabled = loading || adding || [...rows.values()].some(state => state.pending);
 }
@@ -108,7 +267,7 @@ function renderJob(job) {
 }
 function invalidateEmbedding(state, confirmed) {
   const job = embeddingJobs.get(state.item.id);
-  if (job && (!confirmed || !sameSource(job.snapshot, confirmed))) {
+  if (job && (!confirmed || !sourceMatches(confirmed, job))) {
     embeddingJobs.delete(job.id);
     state.embedding = null;
     state.renderEmbedding();
@@ -123,8 +282,8 @@ async function processTask(job) {
     // A persistence retry reuses the successful vector; it never recreates the task.
     if (!job.result) job.result = await modelRuntime.embedTask(job.snapshot);
     if (!embeddingIsCurrent(job)) return;
-    await request(`/api/todos/${encodeURIComponent(job.id)}/embedding`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job.result),
+    await localCall('saveEmbedding', job.id, job.result, {
+      expectedSourceRevision: job.sourceRevision, operationId: job.operationId,
     });
     if (embeddingIsCurrent(job)) {
       ++sourceEpoch;
@@ -140,7 +299,7 @@ async function processTask(job) {
         void loadItems();
         requestBackfill();
       }
-    } else job.error = true;
+    } else { job.error = true; job.message = exception.message; }
   } finally {
     job.pending = false;
     renderJob(job);
@@ -159,7 +318,8 @@ async function pumpBackfill() {
     }
   } finally { pumpingBackfill = false; }
 }
-async function requestBackfill() {
+async function requestBackfill({ retry = false } = {}) {
+  if (retry) for (const job of embeddingJobs.values()) job.error = false;
   if (!modelReady || !modelRuntime) return;
   backfillRequested = true;
   if (scanningBackfill) return;
@@ -168,22 +328,25 @@ async function requestBackfill() {
     while (backfillRequested && modelReady) {
       backfillRequested = false;
       const epoch = sourceEpoch;
-      const pending = await request('/api/todos/embeddings/pending');
+      const response = await localCall('pendingEmbeddings');
+      const pending = response.records;
       if (epoch !== sourceEpoch) { backfillRequested = true; continue; }
-      const byId = new Map(pending.map(item => [item.id, item]));
+      const byId = new Map(pending.map(record => [record.todo.id, record]));
       for (const [id, job] of embeddingJobs) {
-        if (!byId.has(id) || !sameSource(job.snapshot, byId.get(id))) {
+        if (!byId.has(id) || !sourceMatches(byId.get(id), job)) {
           embeddingJobs.delete(id);
           renderJob(job);
         }
       }
-      for (const item of pending) {
+      for (const record of pending) {
+        const item = record.todo;
         let job = embeddingJobs.get(item.id);
         if (!job) {
           job = { id: item.id, snapshot: { title: item.title, icon: item.icon },
+            sourceRevision: record.source_revision, operationId: operationId(),
             result: null, pending: false, error: false };
           embeddingJobs.set(item.id, job);
-        } else job.error = false;
+        }
         renderJob(job);
       }
       void pumpBackfill();
@@ -202,7 +365,7 @@ function formatSimilarity(score) {
   return `Similarity ${Number(score).toFixed(2)}`;
 }
 // The static #search-explain copy is the fallback. Each successful response
-// may carry the server-owned cutoff (min_score); render it verbatim so the
+// carries the repository cutoff (min_score); render it verbatim so the
 // guidance always explains the cutoff that actually filtered these results
 // instead of a value hard-coded in the page.
 const defaultSearchGuidance = searchExplain?.textContent ?? '';
@@ -280,13 +443,15 @@ async function runSearch(query, sequence) {
     if (!result) result = await modelRuntime.embedQuery(query);
     if (sequence !== searchSequence) return;
     queryEmbedding = { query, result };
-    const response = await request('/api/todos/search', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result),
-    });
+    const response = await localCall('search', result);
     if (sequence !== searchSequence) return;
-    const resync = response.matches.some(match => {
+    if (response.sequence < Math.max(databaseSequence, observedDatabaseSequence)) {
+      void resyncSources(query, sequence);
+      return;
+    }
+    const resync = response.sequence > databaseSequence || response.matches.some(match => {
       const state = rows.get(match.todo.id);
-      return state && !sameSource(state.item, match.todo);
+      return !state || state.sourceRevision !== match.source_revision || !sameSource(state.item, match.todo);
     });
     if (resync) {
       // A saved source changed elsewhere (for example in another tab). Never
@@ -424,7 +589,8 @@ document.addEventListener('pointerdown', event => {
   if (openPicker && !openPicker.container.contains(event.target)) openPicker.close();
 });
 
-function makeRow(item) {
+function makeRow(record) {
+  const item = record.todo;
   const row = document.createElement('li');
   row.className = 'task-row';
   row.dataset.id = item.id;
@@ -485,7 +651,8 @@ function makeRow(item) {
   const state = { row, title, editor, completion, remove, item, draft: { title: item.title, icon: item.icon },
     editing: false, composing: false, pending: false, removingIntent: false,
     failedAction: 'save', failedCompletion: null, embedding: embeddingJobs.get(item.id) ?? null,
-    hasError: false };
+    hasError: false, recordRevision: record.revision, sourceRevision: record.source_revision,
+    draftRevision: record.revision, attempt: null, conflict: false, missing: false };
   rows.set(item.id, state);
   normalOrder.push(item.id);
   state.renderEmbedding = () => {
@@ -494,7 +661,7 @@ function makeRow(item) {
     embeddingStatus.textContent = job?.pending ? 'Processing…' : '';
     embeddingStatus.hidden = !job?.pending;
     embeddingFeedback.hidden = !job?.error;
-    embeddingMessage.textContent = job?.error ? 'Task saved. Processing failed.' : '';
+    embeddingMessage.textContent = job?.error ? `Task saved. Indexing not confirmed. ${job.message ?? 'Retry processing.'}` : '';
     embeddingRetry.disabled = Boolean(job?.pending);
     embeddingRetry.setAttribute('aria-label', `Retry processing ${state.item.title}`);
     if (retryFocused && embeddingFeedback.hidden) {
@@ -542,23 +709,48 @@ function makeRow(item) {
     state.failedAction = action;
     message.textContent = text;
     feedback.hidden = !text;
+    retry.textContent = state.conflict && action === 'save' ? 'Save my draft' : 'Retry';
+    retry.hidden = state.missing;
     editor.setAttribute('aria-invalid', String(Boolean(text) && action === 'save'));
     labels();
+  }
+  function fail(exception, action) {
+    if (!uncertain(exception)) state.attempt = null;
+    state.conflict = exception.status === 409;
+    rowError(state.conflict
+      ? 'Changed in another tab. Your draft is kept; retry to apply your change to the current task.'
+      : exception.message, action);
+    if ([404, 409].includes(exception.status)) {
+      reconciliationNeeded = true;
+    }
+  }
+  function mutation(method, args, expectedRevision) {
+    if (state.attempt && state.attempt.method !== method) {
+      throw new Error('Retry the unconfirmed change before making another change.');
+    }
+    state.attempt ??= { method, args, options: { expectedRevision, operationId: operationId() } };
+    return localCall(state.attempt.method, ...state.attempt.args, state.attempt.options);
   }
   function pending(action, completed) {
     state.pending = action;
     row.setAttribute('aria-busy', String(Boolean(action)));
-    editor.readOnly = Boolean(action);
-    title.disabled = Boolean(action);
-    completion.disabled = Boolean(action);
-    icon.trigger.disabled = Boolean(action);
-    remove.disabled = Boolean(action);
+    editor.readOnly = Boolean(action) || Boolean(state.attempt);
+    title.disabled = Boolean(action) || Boolean(state.attempt);
+    completion.disabled = Boolean(action) || state.missing || Boolean(state.attempt && state.attempt.method !== 'setCompleted');
+    icon.trigger.disabled = Boolean(action) || Boolean(state.attempt);
+    remove.disabled = Boolean(action) || state.missing || Boolean(state.attempt && state.attempt.method !== 'delete');
     retry.disabled = Boolean(action);
     rowStatus.textContent = action === 'remove' ? 'Removing…'
       : action === 'complete' ? (completed ? 'Marking done…' : 'Reopening…') : 'Saving…';
     rowStatus.hidden = !action;
     updateRefresh();
+    if (!action) scheduleReconciliation();
   }
+  state.showRemoteConflict = () => rowError(state.hasError && state.failedAction !== 'save'
+    ? 'Changed in another tab. Retry to apply your change to the current task.'
+    : 'Changed in another tab. Your draft is kept; choose Save my draft to replace the current title and icon.',
+    state.hasError ? state.failedAction : 'save');
+  state.showRemoteDeletion = () => rowError('Removed in another tab. Your draft is kept; copy it into a new task.');
   function finishEditing(restoreFocus = false) {
     state.editing = false;
     editor.hidden = true;
@@ -566,7 +758,7 @@ function makeRow(item) {
     if (restoreFocus) title.focus();
   }
   function startEditing() {
-    if (state.pending) return;
+    if (state.pending || state.attempt) return;
     editor.value = state.draft.title;
     title.hidden = true;
     editor.hidden = false;
@@ -576,13 +768,13 @@ function makeRow(item) {
     editor.setSelectionRange(editor.value.length, editor.value.length);
   }
   async function save() {
-    if (state.pending || state.composing) return;
+    if (state.pending || state.composing || state.conflict || state.missing) return;
     const draft = { title: state.draft.title.trim(), icon: state.draft.icon };
-    if (!draft.title || draft.title.length > 500) {
+    if (!draft.title || [...draft.title].length > 500) {
       rowError('Use a title with 1–500 characters.');
       return;
     }
-    if (draft.title === state.item.title && draft.icon === state.item.icon) {
+    if (!state.attempt && draft.title === state.item.title && draft.icon === state.item.icon) {
       state.draft = { title: state.item.title, icon: state.item.icon };
       rowError();
       finishEditing(document.activeElement === editor);
@@ -595,11 +787,11 @@ function makeRow(item) {
     tasksChanging();
     rowError();
     try {
-      const updated = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
-      });
-      invalidateEmbedding(state, updated);
-      state.item = updated;
+      const record = await mutation('update', [item.id, draft], state.draftRevision);
+      const updated = record.todo;
+      state.attempt = null;
+      acceptRecord(state, record);
+      state.draftRevision = record.revision;
       state.draft = { title: updated.title, icon: updated.icon };
       state.sync();
       // Restore focus only if the user has stayed in this editor.
@@ -607,7 +799,7 @@ function makeRow(item) {
       pending(false);
       finishEditing(restoreFocus);
       tasksChanged({ backfill: true });
-    } catch (exception) { rowError(exception.message); }
+    } catch (exception) { fail(exception, 'save'); }
     finally {
       pending(false);
       scheduleSearch();
@@ -617,7 +809,7 @@ function makeRow(item) {
     }
   }
   async function setCompleted(desired) {
-    if (state.pending) return;
+    if (state.pending || state.missing) return;
     const focusedControl = document.activeElement;
     pending('complete', desired);
     icon.close();
@@ -626,18 +818,19 @@ function makeRow(item) {
     rowError();
     completion.checked = desired;
     try {
-      const updated = await request(`/api/todos/${encodeURIComponent(item.id)}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ completed: desired }),
-      });
-      invalidateEmbedding(state, updated);
-      state.item = updated;
+      const previousRevision = state.recordRevision;
+      const record = await mutation('setCompleted', [item.id, desired], state.recordRevision);
+      state.attempt = null;
+      acceptRecord(state, record);
+      if (state.draftRevision === previousRevision) state.draftRevision = record.revision;
+      state.conflict = !sameSource(state.draft, state.item) && state.draftRevision !== record.revision;
+      if (state.conflict) state.showRemoteConflict();
       // Completion changes the saved item without submitting or discarding drafts.
       labels();
       tasksChanged();
     } catch (exception) {
       state.failedCompletion = desired;
-      rowError(exception.message, 'complete');
+      fail(exception, 'complete');
     } finally {
       pending(false);
       scheduleSearch();
@@ -647,7 +840,7 @@ function makeRow(item) {
     }
   }
   async function removeItem() {
-    if (state.pending) return;
+    if (state.pending || state.missing) return;
     const hadFocus = row.contains(document.activeElement) || state.removingHadFocus;
     pending('remove');
     icon.close();
@@ -655,7 +848,8 @@ function makeRow(item) {
     tasksChanging();
     rowError();
     try {
-      await request(`/api/todos/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+      await mutation('delete', [item.id], state.recordRevision);
+      state.attempt = null;
       // Focus must land on a visible row: filtered-out matches are hidden and
       // cannot receive focus. Scan outward from the removed row instead of
       // only checking its immediate neighbours.
@@ -682,7 +876,7 @@ function makeRow(item) {
       }
       tasksChanged();
     } catch (exception) {
-      rowError(exception.message, 'remove');
+      fail(exception, 'remove');
       pending(false);
       if (hadFocus && document.activeElement === document.body) remove.focus();
     }
@@ -699,10 +893,12 @@ function makeRow(item) {
   editor.addEventListener('keydown', event => {
     if (event.isComposing || state.composing || event.keyCode === 229) return;
     if (event.key === 'Enter') { event.preventDefault(); save(); }
-    if (event.key === 'Escape' && !state.pending) {
+    if (event.key === 'Escape' && !state.pending && !state.attempt) {
       event.preventDefault();
       state.draft = { title: state.item.title, icon: state.item.icon };
       revision++;
+      state.conflict = false;
+      state.draftRevision = state.recordRevision;
       rowError();
       state.sync();
       finishEditing(true);
@@ -711,7 +907,7 @@ function makeRow(item) {
   row.addEventListener('focusout', event => {
     // Moving to this row's controls must not start a competing save.
     if (arrangingRows || !state.editing || state.pending || state.removingIntent || row.contains(event.relatedTarget)
-      || event.relatedTarget === refreshButton) return;
+      || event.relatedTarget === refreshButton || storagePanel?.contains(event.relatedTarget)) return;
     save();
   });
   remove.addEventListener('pointerdown', () => {
@@ -725,6 +921,10 @@ function makeRow(item) {
   }
   remove.addEventListener('click', removeItem);
   retry.addEventListener('click', () => {
+    if (state.conflict) {
+      state.conflict = false;
+      if (state.failedAction === 'save') state.draftRevision = state.recordRevision;
+    }
     if (state.failedAction === 'remove') removeItem();
     else if (state.failedAction === 'complete') setCompleted(state.failedCompletion);
     else save();
@@ -738,7 +938,7 @@ function makeRow(item) {
   list.append(row);
 }
 
-async function loadItems() {
+async function loadItems({ retryIndexing = false } = {}) {
   // Reports whether the refresh applied: only then has tasksChanged()
   // rescheduled dependent work such as an awaiting search reconciliation.
   if (loading || adding || [...rows.values()].some(state => state.pending)) return false;
@@ -747,34 +947,48 @@ async function loadItems() {
   updateRefresh();
   showError();
   try {
-    const items = await request('/api/todos');
-    if (snapshot !== revision) return false;
-    const byId = new Map(items.map(item => [item.id, item]));
+    const response = await localCall('list');
+    if (snapshot !== revision || response.sequence < Math.max(databaseSequence, observedDatabaseSequence)) {
+      reconciliationNeeded = true;
+      return false;
+    }
+    const records = response.records;
+    const items = records.map(record => record.todo);
+    const byId = new Map(records.map(record => [record.todo.id, record]));
     for (const [id, state] of rows) {
       const dirty = state.draft.title !== state.item.title || state.draft.icon !== state.item.icon;
       const preserveDraft = state.editing || dirty || state.row.contains(document.activeElement);
       if (state.pending) continue;
       if (!byId.has(id)) {
         invalidateEmbedding(state, null);
-        if (preserveDraft) continue;
+        if (preserveDraft || state.hasError || state.attempt) {
+          state.missing = true;
+          state.showRemoteDeletion();
+          continue;
+        }
         state.icon.close(); state.row.remove(); rows.delete(id);
       }
       else {
         const updated = byId.get(id);
-        invalidateEmbedding(state, updated);
         const oldItem = state.item;
+        const oldRevision = state.recordRevision;
         // Focus alone protects the row from removal, not its draft: rebase
         // untouched fields onto the refreshed source while preserving actual
         // edits, so leaving the editor without typing never PUTs stale text.
         const userEdited = state.editing
           || state.draft.title !== oldItem.title
           || state.draft.icon !== oldItem.icon;
-        state.item = updated;
+        acceptRecord(state, updated);
         if (userEdited) {
-          if (state.draft.title === oldItem.title) state.draft.title = updated.title;
-          if (state.draft.icon === oldItem.icon) state.draft.icon = updated.icon;
+          if (state.draft.title === oldItem.title) state.draft.title = updated.todo.title;
+          if (state.draft.icon === oldItem.icon) state.draft.icon = updated.todo.icon;
         } else {
-          state.draft = { title: updated.title, icon: updated.icon };
+          state.draft = { title: updated.todo.title, icon: updated.todo.icon };
+        }
+        if (!dirty && !state.attempt) state.draftRevision = updated.revision;
+        else if (oldRevision !== updated.revision && dirty && !state.attempt) {
+          state.conflict = true;
+          state.showRemoteConflict();
         }
         const editorFocused = state.editing && document.activeElement === state.editor;
         const selection = editorFocused ? [state.editor.selectionStart, state.editor.selectionEnd] : null;
@@ -782,16 +996,19 @@ async function loadItems() {
         if (selection) state.editor.setSelectionRange(...selection);
       }
     }
-    for (const item of items) if (!rows.has(item.id)) makeRow(item);
+    for (const record of records) if (!rows.has(record.todo.id)) makeRow(record);
+    databaseSequence = response.sequence;
+    reconciliationNeeded = false;
     normalOrder = [...items.map(item => item.id), ...normalOrder.filter(id => rows.has(id) && !byId.has(id))];
     updateCount();
     tasksChanged();
     return true;
   } catch (exception) {
+    reconciliationNeeded = false;
     showError(exception.message);
     if (!rows.size) { status.textContent = 'Could not load your tasks. Try Refresh.'; status.hidden = false; }
   }
-  finally { loading = false; updateRefresh(); requestBackfill(); }
+  finally { loading = false; updateRefresh(); requestBackfill({ retry: retryIndexing }); scheduleReconciliation(); }
 }
 const composerPicker = makeIconControl(document.querySelector('#composer-icon'), 'task', 'New task icon', value => {
   composerIcon = value;
@@ -804,7 +1021,7 @@ function openComposer() {
   input.focus();
 }
 function closeComposer() {
-  if (adding) return;
+  if (adding || composerAttempt) return;
   composerPicker.close();
   input.value = '';
   composerIcon = 'task';
@@ -831,7 +1048,7 @@ form.addEventListener('submit', async event => {
   event.preventDefault();
   if (adding || composerComposing) return;
   const title = input.value.trim();
-  if (!title || title.length > 500) {
+  if (!title || [...title].length > 500) {
     showError('Use a title with 1–500 characters.');
     input.setAttribute('aria-invalid', 'true');
     input.focus();
@@ -850,31 +1067,35 @@ form.addEventListener('submit', async event => {
   updateRefresh();
   showError();
   try {
-    const item = await request('/api/todos', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title, icon: composerIcon }),
-    });
-    if (!rows.has(item.id)) makeRow(item);
+    composerAttempt ??= { draft: { title, icon: composerIcon }, options: { operationId: operationId() } };
+    const record = await localCall('create', composerAttempt.draft, composerAttempt.options);
+    composerAttempt = null;
+    if (!rows.has(record.todo.id)) makeRow(record);
     tasksChanged({ backfill: true });
     input.value = '';
     composerIcon = 'task';
     composerPicker.update('task');
     updateCount();
-  } catch (exception) { showError(exception.message); }
+  } catch (exception) {
+    if (!uncertain(exception)) composerAttempt = null;
+    showError(exception.message);
+  }
   finally {
     adding = false;
-    input.readOnly = false;
-    composerPicker.trigger.disabled = false;
+    input.readOnly = Boolean(composerAttempt);
+    composerPicker.trigger.disabled = Boolean(composerAttempt);
     addButton.disabled = false;
-    cancelAdd.disabled = false;
+    cancelAdd.disabled = Boolean(composerAttempt);
     form.setAttribute('aria-busy', 'false');
     updateRefresh();
+    addButton.textContent = composerAttempt ? 'Retry save' : 'Add';
+    scheduleReconciliation();
     scheduleSearch();
     // Keep consecutive entry convenient without stealing focus from another row.
     if (form.contains(document.activeElement) || document.activeElement === document.body) input.focus();
   }
 });
-refreshButton.addEventListener('click', loadItems);
+refreshButton.addEventListener('click', () => loadItems({ retryIndexing: true }));
 searchInput?.addEventListener('input', () => {
   searchMatches = null;
   clearSearchScores();
@@ -912,4 +1133,26 @@ document.addEventListener('focusout', () => {
     applySearchView();
   }, 0);
 });
-loadItems();
+import('/static/storage-panel.mjs').then(module => {
+  storagePanel = module.initStoragePanel({
+    getRepository,
+    onImported: () => { reconciliationNeeded = true; scheduleReconciliation(); },
+    recover: async () => {
+      await getRepository();
+      const result = await repositoryConnection.recover();
+      storageInitialization = result;
+      storagePanel.setReady(result);
+      await loadItems({ retryIndexing: true });
+      if (!error.hidden) throw new Error(error.textContent);
+      storageFailure = null;
+    },
+    isBusy: () => adding || [...rows.values()].some(state => state.pending || state.attempt) || Boolean(composerAttempt),
+  });
+  if (storageInitialization) storagePanel.setReady(storageInitialization);
+  if (storageFailure) storagePanel.setError(storageFailure);
+}).catch(() => {});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') { reconciliationNeeded = true; scheduleReconciliation(); }
+});
+globalThis.addEventListener?.('pageshow', () => { reconciliationNeeded = true; scheduleReconciliation(); });
+void loadItems();

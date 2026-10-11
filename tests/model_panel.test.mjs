@@ -172,6 +172,48 @@ test('lifecycle: unsupported browsers explain without a working retry', async ()
   }
 });
 
+test('cache status and recovery stay independent of model loading and task feedback', async () => {
+  const runtime = makeStubRuntime();
+  const elements = { ...makeElements(), offlineStatus:makeElement(), offlineError:makeElement(), offlineRetry:makeElement() };
+  let publish, retries = 0, unsubscribed = false;
+  const offlineRuntime = {
+    subscribe(listener) { publish = listener; listener({phase:'caching'}); return () => { unsubscribed = true; }; },
+    async initialize() {},
+    async recover() { ++retries; publish({phase:'ready'}); },
+  };
+  const panel = initModelPanel({runtime,offlineRuntime,...elements,root:null});
+  await tick();
+  runtime.publish({phase:'loading',progress:0.3});
+  publish({phase:'error',message:'App cache full'});
+  assert.equal(elements.offlineError.textContent,'App cache full');
+  assert.match(elements.statusEl.textContent,/Loading model/);
+  await panel.retryOffline();
+  assert.equal(retries,1);
+  assert.equal(elements.offlineStatus.textContent,'App cached.');
+  assert.equal(elements.offlineError.hidden,true);
+  assert.equal(runtime.loadCalls,1,'App cache recovery does not restart inference');
+  panel.destroy();
+  assert.equal(unsubscribed,true);
+});
+
+test('model cache recovery disposes cached assets then requires inference again', async () => {
+  const runtime = makeStubRuntime();
+  let cleared = 0;
+  runtime.clearCache = async () => { ++cleared; };
+  const elements = { ...makeElements(), cacheButton:makeElement() };
+  const panel = initModelPanel({runtime,...elements,root:null});
+  await tick();
+  runtime.publish({phase:'error',message:'Cache incomplete'});
+  assert.equal(elements.cacheButton.hidden,false);
+  await panel.clearModelCache();
+  assert.equal(cleared,1);
+  assert.equal(runtime.loadCalls,2);
+  runtime.publish({phase:'testing'});
+  assert.equal(elements.cacheButton.hidden,true);
+  assert.equal(elements.panel.classList.contains('is-ready'),false);
+  panel.destroy();
+});
+
 test('markup: model status bar precedes the page heading with accessible search controls', () => {
   const html = readStatic('index.html');
   assert.ok(html.includes('id="model-panel"'), 'model panel exists');
