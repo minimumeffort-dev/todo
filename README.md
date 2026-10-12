@@ -4,8 +4,8 @@ A to-do app that runs entirely in the browser. Add tasks, edit titles and
 icons, mark tasks as done, and reopen them later. Completed tasks stay in the
 list. Saved tasks, their completion states and their search embeddings are
 stored locally in your browser and remain after reloading the page,
-restarting the browser, or going offline. There is no server, no account,
-and no cross-device sync.
+restarting the browser, or going offline. There is no account and no
+cross-device sync. Browser tasks do not require a task backend.
 
 ## Quick start
 
@@ -25,6 +25,23 @@ URLs as production; source edits appear after reload.
 npm run build    # reproducible static output in dist/
 npm run preview  # serve the built app locally
 ```
+
+To use the retained FastAPI host at <http://127.0.0.1:8000>, build before
+starting it from the project directory. Python 3.10 or later is required
+for this host:
+
+```sh
+python -m pip install "fastapi>=0.115,<1" "pydantic>=2,<3" "duckdb>=1.1,<2" "uvicorn>=0.30,<1"
+npm run build
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+FastAPI serves the complete `dist/` output, including `/service-worker.mjs`,
+`/asset-manifest.json`, and `/vendor/` runtimes. It does not build or fetch
+assets during requests. A missing or incomplete build returns HTTP 503 at
+`/` with build instructions; unknown assets return 404. The retained
+`/health` and task API routes work without a build. Browser tasks still use
+OPFS and do not send task API requests.
 
 Choose **+ New task**, write a task, then press Enter or choose **Add**. The
 inline composer stays ready for consecutive tasks. Escape or **×** closes it
@@ -195,6 +212,15 @@ internet connection, reusing the downloaded assets. Ordinary task operations
 never depend on model availability. Cache cleanup and app updates preserve
 the OPFS task database.
 
+If worker registration returns 404 or the local Transformers.js runtime
+cannot load, run `npm run build`, restart the host, and reload the same
+origin where you saved tasks. Confirm `/service-worker.mjs`,
+`/asset-manifest.json`, and `/vendor/transformers/transformers.min.js` return
+200 before retrying the app's cache or model controls. Use **Retry app cache**
+for an app-cache error, then **Retry** for a model error. Recovery preserves
+task data. Changing the hostname or port opens a different origin's storage;
+keep the original origin and avoid clearing site data.
+
 ## Browser requirements
 
 Task persistence requires a secure origin (HTTPS or loopback), dedicated
@@ -262,6 +288,19 @@ npm run test:opfs                     # OPFS persistence gate (persistent profil
 npm run test:integration              # persistence/restart, tabs, guards, backups, usability
 npm run test:network                 # offline restart, real inference, zero-backend audit
 ```
+
+For FastAPI regressions, install the Python test dependencies and run:
+
+```sh
+python -m pip install "pytest>=8,<9" "httpx>=0.27,<1"
+PYTHONDONTWRITEBYTECODE=1 python -B -m pytest -p no:cacheprovider -q tests/test_serving.py tests/test_health.py tests/test_todos.py tests/test_embeddings.py tests/test_search.py
+```
+
+Keep preparation baselines read-only: run `npm test` and the four retained
+FastAPI suites with these bytecode and cache flags. Run builds and static
+distribution checks separately. Serving tests build isolated assets in a
+temporary directory and check bytes, hashes, MIME types, revalidation,
+missing builds, and path containment through FastAPI and Uvicorn.
 
 `tests/test_model_assets.py` needs only the system Python 3 standard library
 plus Node 22 (`MODEL_TEST_NODE` overrides discovery). Browser specs start

@@ -1,16 +1,18 @@
-"""Run locally with: uvicorn app.main:app --host 127.0.0.1 --port 8000."""
+"""Build with npm run build, then serve with uvicorn app.main:app."""
 
 from contextlib import asynccontextmanager
+import json
 import math
 import os
 from pathlib import Path
+import stat
 import struct
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
@@ -96,7 +98,9 @@ class SearchResults(BaseModel):
     min_score: float
 
 
-def create_app(db_path: str | Path | None = None) -> FastAPI:
+def create_app(
+    db_path: str | Path | None = None, *, dist_path: str | Path | None = None
+) -> FastAPI:
     default_path = Path(__file__).resolve().parent.parent / "data" / "todos.duckdb"
     store = TodoStore(db_path if db_path is not None else os.environ.get("TODO_DB_PATH", default_path))
 
@@ -175,13 +179,39 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="To-do item not found")
         return Response(status_code=204)
 
-    static_path = Path(__file__).resolve().parent / "static"
-    if static_path.is_dir():
-        application.mount("/static", StaticFiles(directory=static_path), name="static")
+    distribution = Path(dist_path) if dist_path is not None else Path(__file__).resolve().parent.parent / "dist"
+    assets = StaticFiles(directory=distribution.resolve(), check_dir=False)
 
-        @application.get("/", include_in_schema=False)
-        def index():
-            return FileResponse(static_path / "index.html")
+    # Use StaticFiles' containment, MIME and ETag handling directly so an
+    # absent build still leaves assets as 404s.
+    async def browser_asset(request: Request):
+        asset_path = assets.get_path(request.scope)
+        if asset_path in (".", "index.html"):
+            try:
+                manifest_path, _ = assets.lookup_path("asset-manifest.json")
+                manifest = json.loads(Path(manifest_path).read_text())
+                urls = [entry["url"] for entry in manifest["assets"]]
+                if not urls or any(not isinstance(url, str) or not url.startswith("/") for url in urls):
+                    raise ValueError("Invalid asset manifest")
+                required = ["index.html", "service-worker.mjs", "asset-manifest.json"]
+                for path in required + [url.lstrip("/") for url in urls]:
+                    _, status = assets.lookup_path(path)
+                    if status is None or not stat.S_ISREG(status.st_mode):
+                        raise ValueError("Incomplete distribution")
+            except (OSError, ValueError, KeyError, TypeError):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Browser build is missing or incomplete. Run npm run build in the project directory, then restart the server and reload this origin.",
+                    headers={"Cache-Control": "no-cache"},
+                ) from None
+        response = await assets.get_response("index.html" if asset_path == "." else asset_path, request.scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+    # Limit asset matches so FastAPI can redirect alternate health/API paths.
+    for path in ("/", "/index.html", "/service-worker.mjs", "/asset-manifest.json",
+                 "/static/{asset_path:path}", "/vendor/{asset_path:path}"):
+        application.add_api_route(path, browser_asset, methods=["GET", "HEAD"], include_in_schema=False)
 
     return application
 
