@@ -169,3 +169,38 @@ and second-tab writes with refresh reconciliation pass against the built
 app. Firefox, Safari, mobile browsers, private modes and embedded webviews
 remain unverified, and API presence alone is still insufficient to claim
 support.
+
+## FastAPI distribution serving gate (2026-10-12)
+
+`tests/browser/serving.spec.mjs` drives the production host instead of the
+inline static fixture: an owned Uvicorn process running `app.main:app` over
+loopback on an allocated port, plus a fresh persistent Chromium profile. It
+reproduces the original port-8000 report (`/` loaded while
+`/service-worker.mjs`, `/asset-manifest.json` and every `/vendor/` runtime
+returned 404) and proves the repaired host:
+
+- every `asset-manifest.json` entry (31 assets in the 2026-10-12 build)
+  loads with the manifest's size and SHA-256 and a JavaScript/Wasm/JSON MIME
+  type; `/service-worker.mjs` and the manifest require revalidation;
+  unknown asset paths stay 404 while `/health` and `/api/todos` keep working;
+- the root service worker activates with `/` scope from
+  `/service-worker.mjs`;
+- a dedicated worker imports the served
+  `/vendor/transformers/transformers.min.js` and reports `env.version 4.3.1`
+  without loading weights or requiring WebGPU (an unimportable runtime posts
+  an error instead of a version, which fails the gate);
+- a task created through the UI is still visible after an offline reload,
+  with zero `/api/` and zero non-origin requests.
+
+Start the production host with `npm run build` first, then e.g.
+`PYTHONDONTWRITEBYTECODE=1 TODO_DB_PATH=<isolated>/todos.duckdb python -B
+-m uvicorn app.main:app --host 127.0.0.1 --port 8000`.
+
+Observed with Chromium 140.0.7339.186 headless on Debian 12 Linux
+arm64: all three serving-spec cases pass against the owned FastAPI host —
+31 manifest payload assets verified by size, SHA-256 and MIME type with the
+manifest itself fetched as `application/json` under `no-cache`, the root
+service worker active with `/` scope, a dedicated worker importing the
+served Transformers.js build and reporting `env.version 4.3.1`, and a
+UI-created task still visible after an offline
+reload with zero `/api/` and zero non-origin requests.
